@@ -18,6 +18,7 @@
 #include "plugin-main.h"
 #include "sync-debug.h"
 #include "ndi-finder.h"
+#include "frame-tap-registry.h"
 
 #include <util/platform.h>
 #include <util/threading.h>
@@ -128,6 +129,8 @@ typedef struct ndi_source_t {
 	uint32_t height;
 
 	uint64_t last_frame_timestamp;
+
+	frame_tap_registry_t frame_taps;
 } ndi_source_t;
 
 static obs_source_t *find_filter_by_id(obs_source_t *context, const char *id)
@@ -899,6 +902,7 @@ void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v
 	obs_video_frame->data[0] = ndi_video_frame->p_data;
 	SYNC_DEBUG_LOG_VIDEO_TIME("OBS <- ndi_source_thread", obs_source_get_name(obs_source),
 				  (int64_t)obs_video_frame->timestamp, obs_video_frame->data[0]);
+	frame_tap_registry_invoke(&source->frame_taps, obs_source, obs_video_frame);
 	obs_source_output_video(obs_source, obs_video_frame);
 }
 
@@ -1249,6 +1253,8 @@ void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)
 
 	auto s = (ndi_source_t *)bzalloc(sizeof(ndi_source_t));
 	s->obs_source = obs_source;
+	frame_tap_registry_init(&s->frame_taps);
+	frame_tap_registry_register_procs(&s->frame_taps, obs_source_get_proc_handler(s->obs_source));
 	new_ndi_receiver_name(obs_source_name, &(s->config.ndi_receiver_name));
 
 	auto sh = obs_source_get_signal_handler(s->obs_source);
@@ -1268,7 +1274,9 @@ void ndi_source_destroy(void *data)
 
 	auto sh = obs_source_get_signal_handler(s->obs_source);
 	signal_handler_disconnect(sh, "rename", on_ndi_source_renamed, s);
+	frame_tap_registry_clear(&s->frame_taps);
 	ndi_source_thread_stop(s);
+	frame_tap_registry_destroy(&s->frame_taps);
 
 	if (s->config.ndi_receiver_name) {
 		bfree(s->config.ndi_receiver_name);
