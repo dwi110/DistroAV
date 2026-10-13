@@ -105,3 +105,11 @@ configure_file(
 file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/distroav.ico" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_SOURCE_DIR}/lib/ndi)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+option(ENABLE_UNIT_TESTS "Build decision unit tests" OFF)
+if(ENABLE_UNIT_TESTS)
+  enable_testing()
+  add_executable(test-source-decision src/test-source-decision.cpp)
+  target_include_directories(test-source-decision PRIVATE src)
+  add_test(NAME test-source-decision COMMAND test-source-decision)
+endif()

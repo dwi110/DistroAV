@@ -59,17 +59,17 @@ static inline void frame_tap_registry_destroy(frame_tap_registry_t *reg)
 	pthread_mutex_destroy(&reg->mutex);
 }
 
-static inline void frame_tap_registry_add(frame_tap_registry_t *reg, frame_tap_cb callback, void *param)
+static inline bool frame_tap_registry_add(frame_tap_registry_t *reg, frame_tap_cb callback, void *param)
 {
 	if (!callback)
-		return;
+		return false;
 
 	pthread_mutex_lock(&reg->mutex);
 	const size_t n = (size_t)os_atomic_load_long(&reg->count);
 	for (size_t i = 0; i < n; ++i) {
 		if (reg->entries[i].callback == callback && reg->entries[i].param == param) {
 			pthread_mutex_unlock(&reg->mutex);
-			return;
+			return false;
 		}
 	}
 	if (n == reg->capacity) {
@@ -81,10 +81,12 @@ static inline void frame_tap_registry_add(frame_tap_registry_t *reg, frame_tap_c
 	reg->entries[n].param = param;
 	os_atomic_set_long(&reg->count, (long)(n + 1));
 	pthread_mutex_unlock(&reg->mutex);
+	return true;
 }
 
-static inline void frame_tap_registry_remove(frame_tap_registry_t *reg, frame_tap_cb callback, void *param)
+static inline bool frame_tap_registry_remove(frame_tap_registry_t *reg, frame_tap_cb callback, void *param)
 {
+	bool removed = false;
 	pthread_mutex_lock(&reg->mutex);
 	const size_t n = (size_t)os_atomic_load_long(&reg->count);
 	for (size_t i = 0; i < n; ++i) {
@@ -93,10 +95,25 @@ static inline void frame_tap_registry_remove(frame_tap_registry_t *reg, frame_ta
 				reg->entries[j - 1] = reg->entries[j];
 			}
 			os_atomic_set_long(&reg->count, (long)(n - 1));
+			removed = true;
 			break;
 		}
 	}
 	pthread_mutex_unlock(&reg->mutex);
+	return removed;
+}
+
+static inline size_t frame_tap_registry_count(const frame_tap_registry_t *reg)
+{
+	if (!reg)
+		return 0;
+	const long c = os_atomic_load_long(&reg->count);
+	return c > 0 ? (size_t)c : 0;
+}
+
+static inline bool frame_tap_registry_has_consumers(const frame_tap_registry_t *reg)
+{
+	return frame_tap_registry_count(reg) > 0;
 }
 
 static inline void frame_tap_registry_invoke(frame_tap_registry_t *reg, obs_source_t *source,
