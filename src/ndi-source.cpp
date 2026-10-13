@@ -431,11 +431,8 @@ static void ndi_source_frame_tap_remove(void *data, calldata_t *cd)
 	if (consumers == 0) {
 		pthread_mutex_lock(&s->lifecycle_mutex);
 		if (s->running) {
-			const bool keep_alive = keep_thread_alive(
-				s->config.behavior,
-				obs_source_active(s->obs_source),
-				obs_source_showing(s->obs_source),
-				0);
+			const bool keep_alive = keep_thread_alive(s->config.behavior, obs_source_active(s->obs_source),
+								  obs_source_showing(s->obs_source), 0);
 			if (!keep_alive) {
 				obs_log(LOG_DEBUG, "'%s' frame_tap_remove (last consumer): Stopping Source Thread.",
 					obs_source_get_name(s->obs_source));
@@ -492,7 +489,6 @@ void *ndi_source_thread(void *data)
 		HiddenStopped,
 	};
 	HiddenRecvState hidden_state = HiddenRecvState::Showing;
-
 
 	obs_source_audio obs_audio_frame = {};
 	obs_source_frame obs_video_frame = {};
@@ -772,8 +768,7 @@ void *ndi_source_thread(void *data)
 			}
 		} else {
 			if (hidden_state != HiddenRecvState::HiddenStopped) {
-				obs_log(LOG_INFO, "'%s' hidden: stopped receiving (no tap consumers)",
-					obs_source_name);
+				obs_log(LOG_INFO, "'%s' hidden: stopped receiving (no tap consumers)", obs_source_name);
 				hidden_state = HiddenRecvState::HiddenStopped;
 			}
 		}
@@ -1236,11 +1231,8 @@ void ndi_source_update(void *data, obs_data_t *settings)
 	s->config.tally.on_program = tally_on_program(obs_source);
 
 	const size_t consumers = frame_tap_registry_count(&s->frame_taps);
-	const bool keep_alive = keep_thread_alive(
-		s->config.behavior,
-		obs_source_active(obs_source),
-		obs_source_showing(obs_source),
-		consumers);
+	const bool keep_alive = keep_thread_alive(s->config.behavior, obs_source_active(obs_source),
+						  obs_source_showing(obs_source), consumers);
 
 	if (strlen(s->config.ndi_source_name) == 0) {
 		obs_log(LOG_DEBUG, "'%s' ndi_source_update: No NDI Source selected; Requesting Source Thread Stop.",
@@ -1307,11 +1299,8 @@ void ndi_source_hidden(void *data)
 	s->config.tally.on_preview = false;
 	pthread_mutex_lock(&s->lifecycle_mutex);
 	const size_t consumers = frame_tap_registry_count(&s->frame_taps);
-	const bool keep_alive = keep_thread_alive(
-		s->config.behavior,
-		obs_source_active(s->obs_source),
-		false,
-		consumers);
+	const bool keep_alive =
+		keep_thread_alive(s->config.behavior, obs_source_active(s->obs_source), false, consumers);
 	if (s->running && !keep_alive) {
 		obs_log(LOG_DEBUG, "'%s' ndi_source_hidden: Requesting Source Thread Stop.", obs_source_name);
 		// Stopping the thread may result in `on_preview=false` not getting sent,
@@ -1345,11 +1334,8 @@ void ndi_source_deactivated(void *data)
 	s->config.tally.on_program = false;
 	pthread_mutex_lock(&s->lifecycle_mutex);
 	const size_t consumers = frame_tap_registry_count(&s->frame_taps);
-	const bool keep_alive = keep_thread_alive(
-		s->config.behavior,
-		false,
-		obs_source_showing(s->obs_source),
-		consumers);
+	const bool keep_alive =
+		keep_thread_alive(s->config.behavior, false, obs_source_showing(s->obs_source), consumers);
 	if (s->running && !keep_alive) {
 		obs_log(LOG_DEBUG, "'%s' ndi_source_deactivated: Requesting Source Thread Stop.", obs_source_name);
 		ndi_source_thread_stop_locked(s);
