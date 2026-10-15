@@ -77,6 +77,10 @@
 #define PROP_LATENCY_LOW 1
 #define PROP_LATENCY_LOWEST 2
 
+// Low/Lowest latency: skip a received video frame when more than this many newer frames are already
+// queued in the NDI receiver, so the live picture never falls behind the camera.
+#define LIVE_MAX_QUEUED_VIDEO_FRAMES 2
+
 typedef struct ptz_t {
 	bool enabled;
 	float pan;
@@ -510,6 +514,18 @@ void *ndi_source_thread(void *data)
 	const auto web_control_poll_interval = std::chrono::seconds(1);
 	auto web_control_last_poll = std::chrono::steady_clock::time_point{};
 
+	// Receive health, logged once per minute: frames handed to OBS, backlog frames skipped, deepest
+	// NDI receive queue and per-frame processing cost (frame taps + obs_source_output_video).
+	struct {
+		uint64_t window_start_ns;
+		uint32_t frames;
+		uint32_t skipped_backlog;
+		int queue_max;
+		uint64_t process_sum_ns;
+		uint64_t process_max_ns;
+		int64_t ndi_dropped_logged;
+	} recv_stats = {};
+
 	//
 	// Main NDI receiver loop: BEGIN
 	//
@@ -607,6 +623,8 @@ void *ndi_source_thread(void *data)
 				obs_source_name);
 
 			ndi_receiver = ndiLib->recv_create_v3(&recv_desc);
+			recv_stats = {};
+			recv_stats.window_start_ns = os_gettime_ns();
 			// Poll the new receiver's Web Control URL as soon as it connects
 			web_control_last_poll = {};
 
@@ -841,9 +859,48 @@ void *ndi_source_thread(void *data)
 				// VIDEO
 				//
 				// obs_log(LOG_DEBUG, "%s: New Video Frame (Framesync OFF): ts=%d tc=%d", obs_source_name, video_frame.timestamp, video_frame.timecode);
-				ndi_source_thread_process_video2(s, &video_frame, s->obs_source, &obs_video_frame);
+				NDIlib_recv_queue_t queue;
+				ndiLib->recv_get_queue(ndi_receiver, &queue);
+				if (queue.video_frames > recv_stats.queue_max)
+					recv_stats.queue_max = queue.video_frames;
+				if (s->config.latency != PROP_LATENCY_NORMAL &&
+				    queue.video_frames > LIVE_MAX_QUEUED_VIDEO_FRAMES) {
+					recv_stats.skipped_backlog++;
+				} else {
+					const uint64_t process_start_ns = os_gettime_ns();
+					ndi_source_thread_process_video2(s, &video_frame, s->obs_source,
+									 &obs_video_frame);
+					const uint64_t process_ns = os_gettime_ns() - process_start_ns;
+					recv_stats.frames++;
+					recv_stats.process_sum_ns += process_ns;
+					if (process_ns > recv_stats.process_max_ns)
+						recv_stats.process_max_ns = process_ns;
+				}
 
 				ndiLib->recv_free_video_v2(ndi_receiver, &video_frame);
+
+				const uint64_t now_ns = os_gettime_ns();
+				if (now_ns - recv_stats.window_start_ns >= 60000000000ULL) {
+					NDIlib_recv_performance_t perf_total;
+					NDIlib_recv_performance_t perf_dropped;
+					ndiLib->recv_get_performance(ndi_receiver, &perf_total, &perf_dropped);
+					obs_log(LOG_INFO,
+						"'%s' receive: frames=%u skipped-backlog=%u ndi-dropped=%lld queue-max=%d process avg=%.3fms max=%.3fms",
+						obs_source_name, recv_stats.frames, recv_stats.skipped_backlog,
+						(long long)(perf_dropped.video_frames - recv_stats.ndi_dropped_logged),
+						recv_stats.queue_max,
+						recv_stats.frames ? (double)recv_stats.process_sum_ns /
+									    (double)recv_stats.frames / 1e6
+								  : 0.0,
+						(double)recv_stats.process_max_ns / 1e6);
+					recv_stats.ndi_dropped_logged = perf_dropped.video_frames;
+					recv_stats.window_start_ns = now_ns;
+					recv_stats.frames = 0;
+					recv_stats.skipped_backlog = 0;
+					recv_stats.queue_max = 0;
+					recv_stats.process_sum_ns = 0;
+					recv_stats.process_max_ns = 0;
+				}
 				continue;
 			}
 
@@ -919,6 +976,10 @@ void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_
 void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v2_t *ndi_video_frame,
 				      obs_source *obs_source, obs_source_frame *obs_video_frame)
 {
+	obs_video_frame->data[1] = nullptr;
+	obs_video_frame->data[2] = nullptr;
+	obs_video_frame->linesize[1] = 0;
+	obs_video_frame->linesize[2] = 0;
 	switch (ndi_video_frame->FourCC) {
 	case NDIlib_FourCC_type_BGRA:
 		obs_video_frame->format = VIDEO_FORMAT_BGRA;
@@ -940,10 +1001,19 @@ void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v
 
 	case NDIlib_FourCC_type_I420:
 		obs_video_frame->format = VIDEO_FORMAT_I420;
+		obs_video_frame->linesize[1] = (uint32_t)ndi_video_frame->line_stride_in_bytes / 2;
+		obs_video_frame->linesize[2] = obs_video_frame->linesize[1];
+		obs_video_frame->data[1] = ndi_video_frame->p_data + (size_t)ndi_video_frame->line_stride_in_bytes *
+									     (size_t)ndi_video_frame->yres;
+		obs_video_frame->data[2] = obs_video_frame->data[1] + (size_t)obs_video_frame->linesize[1] *
+									      (size_t)((ndi_video_frame->yres + 1) / 2);
 		break;
 
 	case NDIlib_FourCC_type_NV12:
 		obs_video_frame->format = VIDEO_FORMAT_NV12;
+		obs_video_frame->linesize[1] = (uint32_t)ndi_video_frame->line_stride_in_bytes;
+		obs_video_frame->data[1] = ndi_video_frame->p_data + (size_t)ndi_video_frame->line_stride_in_bytes *
+									     (size_t)ndi_video_frame->yres;
 		break;
 
 	default:
