@@ -620,7 +620,11 @@ obs_audio_data *ndi_filter_asyncaudio(void *data, obs_audio_data *audio_data)
 #ifdef SYNC_DEBUG
 	audio_frame.timestamp = audio_data->timestamp / 100;
 #endif
-	audio_frame.timecode = NDIlib_send_timecode_synthesize;
+	// Synthesized timecode misplaces variable-size audio chunks at file-loop boundaries.
+	// Audio-only senders can preserve the source sample clock without changing AV filter timing.
+	audio_frame.timecode = f->is_audioonly && audio_data->timestamp != 0
+				       ? static_cast<int64_t>(audio_data->timestamp / 100)
+				       : NDIlib_send_timecode_synthesize;
 	audio_frame.no_samples = audio_data->frames;
 	audio_frame.channel_stride_in_bytes =
 		audio_frame.no_samples *
