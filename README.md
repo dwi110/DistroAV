@@ -36,6 +36,8 @@ Transmit OBS video and audio to NDI
 (a.k.a. **NDI Dedicated Output**)
 Transmit a single OBS source or scene audio to NDI.
 
+Audio-only filters preserve valid OBS source timestamps as NDI timecodes, including variable-size final audio chunks at media-loop boundaries. This avoids overlaps/gaps caused by synthesized timecodes; the combined audio/video filter keeps its existing clock behavior.
+
 <img width="400" alt="DistroAV-NDI-Filters-Feature-Window" src="https://github.com/user-attachments/assets/6952da7a-a621-4b42-b737-857de83f5615" />
 
 # Installation
