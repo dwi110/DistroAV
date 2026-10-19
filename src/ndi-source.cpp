@@ -534,8 +534,13 @@ void ndi_source_join_retired_receivers()
 		std::lock_guard<std::mutex> lock(retired_ndi_receivers_mutex);
 		pending.swap(retired_ndi_receivers);
 	}
-	if (!pending.empty())
-		obs_log(LOG_INFO, "Waiting for %zu retired NDI receivers", pending.size());
+	size_t running = 0;
+	for (auto &retired : pending) {
+		if (!retired.done->load())
+			running++;
+	}
+	if (running)
+		obs_log(LOG_INFO, "Waiting for %zu retired NDI receivers still being destroyed", running);
 	for (auto &retired : pending)
 		retired.thread.join();
 }
