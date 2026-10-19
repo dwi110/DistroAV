@@ -27,9 +27,13 @@
 #include <QDesktopServices>
 #include <QUrl>
 
+#include <atomic>
 #include <chrono>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #define PROP_SOURCE "ndi_source_name"
 #define PROP_BEHAVIOR "ndi_behavior"
@@ -478,6 +482,64 @@ void update_web_control_url(ndi_source_t *s, NDIlib_recv_instance_t ndi_receiver
 	obs_data_release(update);
 }
 
+//
+// Receivers whose sender closed the session block NDIlib_recv_destroy for ~15 s (NDI 6.3.2), and so do refused
+// reconnect attempts. A fast reconnect hands them to their own thread. Threads are joined (not detached) so that
+// obs_module_unload can wait for all of them before ndiLib->destroy() and before the module is unloaded.
+//
+#define MAX_RETIRED_NDI_RECEIVERS 64
+
+struct retired_ndi_receiver_t {
+	std::thread thread;
+	std::shared_ptr<std::atomic<bool>> done;
+};
+
+static std::mutex retired_ndi_receivers_mutex;
+static std::vector<retired_ndi_receiver_t> retired_ndi_receivers;
+
+static bool retire_ndi_receiver(NDIlib_recv_instance_t receiver, NDIlib_framesync_instance_t frame_sync,
+				const char *obs_source_name)
+{
+	std::lock_guard<std::mutex> lock(retired_ndi_receivers_mutex);
+	for (auto it = retired_ndi_receivers.begin(); it != retired_ndi_receivers.end();) {
+		if (it->done->load()) {
+			it->thread.join();
+			it = retired_ndi_receivers.erase(it);
+		} else {
+			++it;
+		}
+	}
+	if (retired_ndi_receivers.size() >= MAX_RETIRED_NDI_RECEIVERS)
+		return false;
+
+	auto done = std::make_shared<std::atomic<bool>>(false);
+	std::string name = obs_source_name;
+	retired_ndi_receivers.push_back({std::thread([receiver, frame_sync, done, name] {
+						 const uint64_t start_ns = os_gettime_ns();
+						 if (frame_sync)
+							 ndiLib->framesync_destroy(frame_sync);
+						 ndiLib->recv_destroy(receiver);
+						 obs_log(LOG_DEBUG, "'%s' retired NDI receiver destroyed after %.3fs",
+							 name.c_str(), (double)(os_gettime_ns() - start_ns) / 1e9);
+						 done->store(true);
+					 }),
+					 done});
+	return true;
+}
+
+void ndi_source_join_retired_receivers()
+{
+	std::vector<retired_ndi_receiver_t> pending;
+	{
+		std::lock_guard<std::mutex> lock(retired_ndi_receivers_mutex);
+		pending.swap(retired_ndi_receivers);
+	}
+	if (!pending.empty())
+		obs_log(LOG_INFO, "Waiting for %zu retired NDI receivers", pending.size());
+	for (auto &retired : pending)
+		retired.thread.join();
+}
+
 void *ndi_source_thread(void *data)
 {
 	auto s = (ndi_source_t *)data;
@@ -525,6 +587,119 @@ void *ndi_source_thread(void *data)
 		uint64_t process_max_ns;
 		int64_t ndi_dropped_logged;
 	} recv_stats = {};
+
+	// Fast reconnect after the sender closed the session (see should_reconnect): time of the last video frame on
+	// this source, start of the current reconnect attempt, whether that attempt's receiver got connected.
+	uint64_t last_video_ns = 0;
+	uint64_t reconnect_attempt_ns = 0;
+	bool reconnect_attempt_connected = false;
+	int reconnect_attempts = 0;
+
+	// Creates ndi_receiver (and ndi_frame_sync if enabled) from recv_desc; the previous ones must be gone.
+	auto create_ndi_receiver = [&]() -> bool {
+		obs_log(LOG_DEBUG,
+			"'%s' ndi_source_thread: reset_ndi_receiver: recv_desc = { p_ndi_recv_name='%s', source_to_connect_to.p_ndi_name='%s' }",
+			obs_source_name, //
+			recv_desc.p_ndi_recv_name, recv_desc.source_to_connect_to.p_ndi_name);
+		obs_log(LOG_DEBUG,
+			"'%s' ndi_source_thread: reset_ndi_receiver: +ndi_receiver = ndiLib->recv_create_v3(&recv_desc)",
+			obs_source_name);
+
+		ndi_receiver = ndiLib->recv_create_v3(&recv_desc);
+		recv_stats = {};
+		recv_stats.window_start_ns = os_gettime_ns();
+		// Poll the new receiver's Web Control URL as soon as it connects
+		web_control_last_poll = {};
+
+		obs_log(LOG_DEBUG,
+			"'%s' ndi_source_thread: reset_ndi_receiver: -ndi_receiver = ndiLib->recv_create_v3(&recv_desc)",
+			obs_source_name);
+		if (!ndi_receiver) {
+			obs_log(LOG_ERROR, "ERR-407 - Error creating the NDI Receiver '%s' set for '%s'",
+				recv_desc.source_to_connect_to.p_ndi_name, obs_source_name);
+			obs_log(LOG_DEBUG,
+				"'%s' ndi_source_thread: reset_ndi_receiver: Cannot create ndi_receiver for NDI source '%s'",
+				obs_source_name, recv_desc.source_to_connect_to.p_ndi_name);
+			return false;
+		}
+
+		if (s->config.hw_accel_enabled) {
+			//
+			// From https://docs.ndi.video/docs/sdk/performance-and-implementation#receiving-video :
+			// > * In the modern versions of NDI, there are internal heuristics that attempt to guess whether hardware
+			// > acceleration would enable better performance. That said, it is possible to explicitly enable hardware
+			// > acceleration if you believe that it would be beneficial for your application. This can be enabled by
+			// > sending an XML metadata message to a receiver as follows:
+			// >	<ndi_video_codec type="hardware"/>
+			//
+			// The wording of this says very unambiguously "it is possible to explicitly enable hardware acceleration",
+			// but this can in reality only ever be a **REQUEST** to enable. The enable could possibly fail for the
+			// obvious reason that the device may not have/support hardware acceleration.
+			//
+			// Furthermore, there is no documented way to request to *disable* hardware acceleration.
+			// I have tried setting the metadata to `<ndi_video_codec type=""/>` or `<ndi_video_codec/>` and it does not
+			// crash, but I was unable to confirm if this actually disabled hardware acceleration, and am skeptical that
+			// it could/would.
+			// So, it seems like there is no way to disable this.
+			// I have asked on the NewTek NDI SDK forum here:
+			// https://forum.vizrt.com/index.php?threads/any-way-to-explicitly-turn-off-hardware-acceleration.253766/
+			//
+			// Regardless, it makes little sense to have a checkbox that requests to enable this when
+			// checked but do nothing when unchecked.
+			// But that is basically what we are going to do here.
+			//
+			// One other way we try to mitigate this is to reset the NDI receiver when hw_accel_enabled is changed
+			// [in `ndi_source_update`]
+			// The theory is that the below `recv_send_metadata` is bound to the NDI receiver instance.
+			// Destroy that receiver instance and you also destroy the metadata and thus the hardware acceleration.
+			// There is no confirmation that this works as theorized.
+			//
+			NDIlib_metadata_frame_t hwAccelMetadata;
+			hwAccelMetadata.p_data = (char *)"<ndi_video_codec type=\"hardware\"/>";
+			obs_log(LOG_DEBUG,
+				"'%s' ndi_source_thread: reset_ndi_receiver; Sending NDI Hardware Acceleration metadata: '%s'",
+				obs_source_name, hwAccelMetadata.p_data);
+			ndiLib->recv_send_metadata(ndi_receiver, &hwAccelMetadata);
+		}
+
+		if (s->config.framesync_enabled) {
+			timestamp_audio = 0;
+			timestamp_video = 0;
+			obs_log(LOG_DEBUG,
+				"'%s' ndi_source_thread: +ndi_frame_sync = ndiLib->framesync_create(ndi_receiver)",
+				obs_source_name);
+			ndi_frame_sync = ndiLib->framesync_create(ndi_receiver);
+			obs_log(LOG_DEBUG,
+				"'%s' ndi_source_thread: -ndi_frame_sync = ndiLib->framesync_create(ndi_receiver); ndi_frame_sync=%p",
+				obs_source_name, //
+				ndi_frame_sync);
+			if (!ndi_frame_sync) {
+				obs_log(LOG_ERROR, "ERR-408 - Error creating the NDI Frame Sync for '%s' for '%s'",
+					recv_desc.source_to_connect_to.p_ndi_name, obs_source_name);
+				obs_log(LOG_DEBUG,
+					"'%s' ndi_source_thread: Cannot create ndi_frame_sync for NDI source '%s'",
+					obs_source_name, recv_desc.source_to_connect_to.p_ndi_name);
+				return false;
+			}
+		}
+
+		return true;
+	};
+
+	// Records a received video frame and logs the end of a fast reconnect.
+	auto note_video_frame = [&]() {
+		const uint64_t now_ns = os_gettime_ns();
+		if (reconnect_attempt_ns != 0) {
+			obs_log(LOG_INFO,
+				"'%s' NDI video resumed %.3fs after the last frame (%d reconnect attempts, %.3fs after the last attempt)",
+				obs_source_name, (double)(now_ns - last_video_ns) / 1e9, reconnect_attempts,
+				(double)(now_ns - reconnect_attempt_ns) / 1e9);
+			reconnect_attempt_ns = 0;
+			reconnect_attempt_connected = false;
+			reconnect_attempts = 0;
+		}
+		last_video_ns = now_ns;
+	};
 
 	//
 	// Main NDI receiver loop: BEGIN
@@ -614,92 +789,12 @@ void *ndi_source_thread(void *data)
 				ndi_receiver = nullptr;
 			}
 
-			obs_log(LOG_DEBUG,
-				"'%s' ndi_source_thread: reset_ndi_receiver: recv_desc = { p_ndi_recv_name='%s', source_to_connect_to.p_ndi_name='%s' }",
-				obs_source_name, //
-				recv_desc.p_ndi_recv_name, recv_desc.source_to_connect_to.p_ndi_name);
-			obs_log(LOG_DEBUG,
-				"'%s' ndi_source_thread: reset_ndi_receiver: +ndi_receiver = ndiLib->recv_create_v3(&recv_desc)",
-				obs_source_name);
-
-			ndi_receiver = ndiLib->recv_create_v3(&recv_desc);
-			recv_stats = {};
-			recv_stats.window_start_ns = os_gettime_ns();
-			// Poll the new receiver's Web Control URL as soon as it connects
-			web_control_last_poll = {};
-
-			obs_log(LOG_DEBUG,
-				"'%s' ndi_source_thread: reset_ndi_receiver: -ndi_receiver = ndiLib->recv_create_v3(&recv_desc)",
-				obs_source_name);
-			if (!ndi_receiver) {
-				obs_log(LOG_ERROR, "ERR-407 - Error creating the NDI Receiver '%s' set for '%s'",
-					recv_desc.source_to_connect_to.p_ndi_name, obs_source_name);
-				obs_log(LOG_DEBUG,
-					"'%s' ndi_source_thread: reset_ndi_receiver: Cannot create ndi_receiver for NDI source '%s'",
-					obs_source_name, recv_desc.source_to_connect_to.p_ndi_name);
+			if (!create_ndi_receiver())
 				break;
-			}
-
-			if (s->config.hw_accel_enabled) {
-				//
-				// From https://docs.ndi.video/docs/sdk/performance-and-implementation#receiving-video :
-				// > * In the modern versions of NDI, there are internal heuristics that attempt to guess whether hardware
-				// > acceleration would enable better performance. That said, it is possible to explicitly enable hardware
-				// > acceleration if you believe that it would be beneficial for your application. This can be enabled by
-				// > sending an XML metadata message to a receiver as follows:
-				// >	<ndi_video_codec type="hardware"/>
-				//
-				// The wording of this says very unambiguously "it is possible to explicitly enable hardware acceleration",
-				// but this can in reality only ever be a **REQUEST** to enable. The enable could possibly fail for the
-				// obvious reason that the device may not have/support hardware acceleration.
-				//
-				// Furthermore, there is no documented way to request to *disable* hardware acceleration.
-				// I have tried setting the metadata to `<ndi_video_codec type=""/>` or `<ndi_video_codec/>` and it does not
-				// crash, but I was unable to confirm if this actually disabled hardware acceleration, and am skeptical that
-				// it could/would.
-				// So, it seems like there is no way to disable this.
-				// I have asked on the NewTek NDI SDK forum here:
-				// https://forum.vizrt.com/index.php?threads/any-way-to-explicitly-turn-off-hardware-acceleration.253766/
-				//
-				// Regardless, it makes little sense to have a checkbox that requests to enable this when
-				// checked but do nothing when unchecked.
-				// But that is basically what we are going to do here.
-				//
-				// One other way we try to mitigate this is to reset the NDI receiver when hw_accel_enabled is changed
-				// [in `ndi_source_update`]
-				// The theory is that the below `recv_send_metadata` is bound to the NDI receiver instance.
-				// Destroy that receiver instance and you also destroy the metadata and thus the hardware acceleration.
-				// There is no confirmation that this works as theorized.
-				//
-				NDIlib_metadata_frame_t hwAccelMetadata;
-				hwAccelMetadata.p_data = (char *)"<ndi_video_codec type=\"hardware\"/>";
-				obs_log(LOG_DEBUG,
-					"'%s' ndi_source_thread: reset_ndi_receiver; Sending NDI Hardware Acceleration metadata: '%s'",
-					obs_source_name, hwAccelMetadata.p_data);
-				ndiLib->recv_send_metadata(ndi_receiver, &hwAccelMetadata);
-			}
-
-			if (s->config.framesync_enabled) {
-				timestamp_audio = 0;
-				timestamp_video = 0;
-				obs_log(LOG_DEBUG,
-					"'%s' ndi_source_thread: +ndi_frame_sync = ndiLib->framesync_create(ndi_receiver)",
-					obs_source_name);
-				ndi_frame_sync = ndiLib->framesync_create(ndi_receiver);
-				obs_log(LOG_DEBUG,
-					"'%s' ndi_source_thread: -ndi_frame_sync = ndiLib->framesync_create(ndi_receiver); ndi_frame_sync=%p",
-					obs_source_name, //
-					ndi_frame_sync);
-				if (!ndi_frame_sync) {
-					obs_log(LOG_ERROR,
-						"ERR-408 - Error creating the NDI Frame Sync for '%s' for '%s'",
-						recv_desc.source_to_connect_to.p_ndi_name, obs_source_name);
-					obs_log(LOG_DEBUG,
-						"'%s' ndi_source_thread: Cannot create ndi_frame_sync for NDI source '%s'",
-						obs_source_name, recv_desc.source_to_connect_to.p_ndi_name);
-					break;
-				}
-			}
+			last_video_ns = 0;
+			reconnect_attempt_ns = 0;
+			reconnect_attempt_connected = false;
+			reconnect_attempts = 0;
 		}
 		//
 		// reset_ndi_receiver: END
@@ -710,16 +805,39 @@ void *ndi_source_thread(void *data)
 		// check if there are any connections.
 		// If not then micro-pause and restart the loop.
 		//
-		if (ndiLib->recv_get_no_connections(ndi_receiver) == 0) {
+		const int connections = ndiLib->recv_get_no_connections(ndi_receiver);
+		if (connections > 0 && reconnect_attempt_ns != 0)
+			reconnect_attempt_connected = true;
+		if (connections == 0) {
 #if 0
 			obs_log(LOG_DEBUG,
 				"'%s' ndi_source_thread: No connection; sleep and restart loop",
 				obs_source_name);
 #endif
+			const uint64_t now_ns = os_gettime_ns();
+			if (should_reconnect(now_ns, last_video_ns, reconnect_attempt_ns,
+					     reconnect_attempt_connected) &&
+			    retire_ndi_receiver(ndi_receiver, ndi_frame_sync, obs_source_name)) {
+				ndi_receiver = nullptr;
+				ndi_frame_sync = nullptr;
+				reconnect_attempts++;
+				reconnect_attempt_ns = now_ns;
+				reconnect_attempt_connected = false;
+				obs_log(LOG_INFO,
+					"'%s' NDI connection lost: reconnect attempt %d at +%.3fs after the last video frame",
+					obs_source_name, reconnect_attempts, (double)(now_ns - last_video_ns) / 1e9);
+				if (!create_ndi_receiver())
+					break;
+				if (config->TallyPreviewEnabled || config->TallyProgramEnabled)
+					ndiLib->recv_set_tally(ndi_receiver, &tally);
+				continue;
+			}
+
 			process_empty_frame(s);
 
 			// This will also slow down the shutdown of OBS when no NDI feed is received.
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			// After a lost connection poll faster so a refused reconnect attempt is noticed within its 30-60 ms.
+			std::this_thread::sleep_for(std::chrono::milliseconds(last_video_ns ? 20 : 100));
 			continue;
 		}
 
@@ -828,6 +946,7 @@ void *ndi_source_thread(void *data)
 							NDIlib_frame_format_type_progressive);
 			if (video_frame.p_data && (video_frame.timestamp > timestamp_video)) {
 				timestamp_video = video_frame.timestamp;
+				note_video_frame();
 				// obs_log(LOG_DEBUG, "%s: New Video Frame (Framesync ON): ts=%d tc=%d", obs_source_name, video_frame.timestamp, video_frame.timecode);
 				ndi_source_thread_process_video2(s, &video_frame, s->obs_source, &obs_video_frame);
 			}
@@ -855,6 +974,7 @@ void *ndi_source_thread(void *data)
 			}
 
 			if (frame_received == NDIlib_frame_type_video) {
+				note_video_frame();
 				//
 				// VIDEO
 				//

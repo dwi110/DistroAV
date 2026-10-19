@@ -52,6 +52,7 @@ static bool plugin_features_registered = false;
 
 extern struct obs_source_info create_ndi_source_info();
 struct obs_source_info ndi_source_info;
+extern void ndi_source_join_retired_receivers();
 
 extern struct obs_output_info create_ndi_output_info();
 struct obs_output_info ndi_output_info;
@@ -535,6 +536,8 @@ void obs_module_unload(void)
 	updateCheckStop();
 
 	if (ndiLib) {
+		// Fast-reconnect receivers still being destroyed on their own threads (up to ~15 s) must finish first.
+		ndi_source_join_retired_receivers();
 		ndiLib->destroy();
 		ndiLib = nullptr;
 	}
