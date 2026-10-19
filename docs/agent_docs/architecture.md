@@ -56,6 +56,17 @@ on the UI thread") shows this has been a source of real bugs — treat any new
 cross-thread state as something to explicitly synchronize, not an oversight to
 fix later.
 
+Fast reconnect in `ndi_source_thread`:
+- When a source that already delivered video loses its NDI connection, the thread creates a new receiver after
+  0.5 s. It does not wait for the SDK's ~16 s reconnect.
+- A refused attempt (connected, then closed by the sender) is retried after 1 s. An attempt that never connected is
+  retried after 5 s. After 60 s without video, every retry waits 5 s. The rule is `should_reconnect` in
+  `ndi-source-decision.h`, covered by `test-source-decision` (`-DENABLE_UNIT_TESTS=ON`).
+- `NDIlib_recv_destroy` blocks ~15 s on a sender-closed session, so the old receiver is destroyed on its own thread
+  (`retire_ndi_receiver`, at most 64 at a time). `obs_module_unload` joins them before `ndiLib->destroy()`.
+- Motivation and measurements (PTZOptics Move SE closes its NDI sessions on a fixed schedule):
+  `dwi110/obs-multicam-instant-replay` `docs/KAMERA-STILLSTAENDE.md`, ADR 0028.
+
 ## Performance-sensitive paths
 
 The plugin's job is real-time A/V transport; the callbacks below run once per

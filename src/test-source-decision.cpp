@@ -68,6 +68,38 @@ int main()
 	assert(keep_thread_alive(PROP_BEHAVIOR_STOP_RESUME_LAST_FRAME, false, true, 0) == true);
 	assert(keep_thread_alive(PROP_BEHAVIOR_STOP_RESUME_LAST_FRAME, true, false, 0) == true);
 
+	// 4. should_reconnect(now, last_video, attempt, attempt_connected)
+	const uint64_t s = 1000000000ULL;
+	const uint64_t ms = 1000000ULL;
+	const uint64_t t0 = 1000 * s; // last video frame
+
+	// Never received video: the SDK handles the initial connect, no fast reconnect
+	assert(should_reconnect(t0, 0, 0, false) == false);
+	assert(should_reconnect(t0 + 100 * s, 0, 0, false) == false);
+
+	// First attempt 0.5 s after the last video frame
+	assert(should_reconnect(t0 + 499 * ms, t0, 0, false) == false);
+	assert(should_reconnect(t0 + 500 * ms, t0, 0, false) == true);
+
+	// Camera refused the attempt (connected, then closed): retry after 1 s
+	const uint64_t a1 = t0 + 500 * ms;
+	assert(should_reconnect(a1 + 999 * ms, t0, a1, true) == false);
+	assert(should_reconnect(a1 + 1 * s, t0, a1, true) == true);
+
+	// Attempt never connected (name lookup or source gone): retry after 5 s, not every second
+	assert(should_reconnect(a1 + 1 * s, t0, a1, false) == false);
+	assert(should_reconnect(a1 + 4999 * ms, t0, a1, false) == false);
+	assert(should_reconnect(a1 + 5 * s, t0, a1, false) == true);
+
+	// After 60 s without video every attempt waits 5 s, refused or not
+	const uint64_t late = t0 + 60 * s;
+	assert(should_reconnect(late + 1 * s, t0, late, true) == false);
+	assert(should_reconnect(late + 5 * s, t0, late, true) == true);
+
+	// Clock values before the reference points never trigger (no unsigned wrap)
+	assert(should_reconnect(t0 - 1, t0, 0, false) == false);
+	assert(should_reconnect(a1 - 1, t0, a1, true) == false);
+
 	std::printf("test-source-decision: ALL ASSERTIONS PASSED\n");
 	return 0;
 }

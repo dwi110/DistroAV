@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifndef PROP_BEHAVIOR_KEEP_ACTIVE
 #define PROP_BEHAVIOR_KEEP_ACTIVE 0
@@ -56,6 +57,40 @@ static inline bool keep_thread_alive(int behavior, bool active, bool showing, si
 	if (behavior == PROP_BEHAVIOR_KEEP_ACTIVE)
 		return true;
 	return active || showing;
+}
+
+/*
+ * Fast reconnect after the sender closed the NDI session.
+ *
+ * PTZOptics Move SE cameras end their NDI session on a fixed schedule (TCP FIN). The NDI SDK (6.3.2) only reconnects
+ * every ~16 s, so the picture stalls 16 s, or 32 s when the camera still refuses the first SDK retry. The camera
+ * accepts a new receiver either at once or after 16-21 s, closing refused sessions within 30-60 ms. A new receiver
+ * per attempt brings the picture back within ~1 s of the camera accepting again.
+ *
+ * Called only while the receiver has no connection. last_video_ns is 0 until the source delivered video (the SDK
+ * handles the initial connect), attempt_ns is 0 until the first attempt after the loss. attempt_connected tells
+ * whether the current attempt's receiver was connected at some point: a refused session is retried after 1 s, a
+ * receiver still resolving the source name or a source that is gone after 5 s. After 60 s without video every
+ * attempt waits 5 s.
+ */
+#define RECONNECT_FIRST_DELAY_NS 500000000ULL
+#define RECONNECT_RETRY_NS 1000000000ULL
+#define RECONNECT_PENDING_NS 5000000000ULL
+#define RECONNECT_SLOW_AFTER_NS 60000000000ULL
+
+static inline bool should_reconnect(uint64_t now_ns, uint64_t last_video_ns, uint64_t attempt_ns,
+				    bool attempt_connected)
+{
+	if (last_video_ns == 0 || now_ns < last_video_ns)
+		return false;
+	if (attempt_ns == 0)
+		return now_ns - last_video_ns >= RECONNECT_FIRST_DELAY_NS;
+	if (now_ns < attempt_ns)
+		return false;
+	uint64_t wait_ns = attempt_connected ? RECONNECT_RETRY_NS : RECONNECT_PENDING_NS;
+	if (now_ns - last_video_ns >= RECONNECT_SLOW_AFTER_NS)
+		wait_ns = RECONNECT_PENDING_NS;
+	return now_ns - attempt_ns >= wait_ns;
 }
 
 #ifdef __cplusplus
