@@ -566,6 +566,11 @@ void *ndi_source_thread(void *data)
 
 	NDIlib_recv_create_v3_t recv_desc;
 	recv_desc.allow_video_fields = true;
+	// recv_desc must not point into s->config: ndi_source_update frees and re-duplicates those strings on every
+	// settings update (e.g. when the Web Control URL arrives), and fast reconnects create receivers from recv_desc
+	// long after the last reset. A dangling source name made reconnect receivers never connect (2026-10-20).
+	std::string recv_receiver_name;
+	std::string recv_source_name;
 
 	NDIlib_recv_instance_t ndi_receiver = nullptr;
 	NDIlib_video_frame_v2_t video_frame;
@@ -722,7 +727,8 @@ void *ndi_source_thread(void *data)
 			//
 			// Update recv_desc.p_ndi_recv_name
 			//
-			recv_desc.p_ndi_recv_name = s->config.ndi_receiver_name;
+			recv_receiver_name = s->config.ndi_receiver_name ? s->config.ndi_receiver_name : "";
+			recv_desc.p_ndi_recv_name = recv_receiver_name.c_str();
 			obs_log(LOG_DEBUG,
 				"'%s' ndi_source_thread: reset_ndi_receiver; Setting recv_desc.p_ndi_recv_name='%s'",
 				obs_source_name, //
@@ -731,7 +737,8 @@ void *ndi_source_thread(void *data)
 			//
 			// Update recv_desc.source_to_connect_to.p_ndi_name
 			//
-			recv_desc.source_to_connect_to.p_ndi_name = s->config.ndi_source_name;
+			recv_source_name = s->config.ndi_source_name ? s->config.ndi_source_name : "";
+			recv_desc.source_to_connect_to.p_ndi_name = recv_source_name.c_str();
 			obs_log(LOG_DEBUG,
 				"'%s' ndi_source_thread: reset_ndi_receiver; Setting recv_desc.source_to_connect_to.p_ndi_name='%s'",
 				obs_source_name, //

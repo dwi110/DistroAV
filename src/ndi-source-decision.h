@@ -72,9 +72,9 @@ static inline bool keep_thread_alive(int behavior, bool active, bool showing, si
  * whether the current attempt's receiver was connected at some point.
  *
  * A refused session (connected, then closed by the camera) is retried after 1 s, after 60 s without video every 5 s.
- * A receiver that has not connected yet is never replaced: a receiver created by NDI name needs ~4 s or more to
- * resolve the name after the camera closed the session, and the SDK connects it as soon as it resolves. Replacing it
- * every few seconds restarts that lookup; on 2026-10-20 a 5-s replacement kept three cameras dark for minutes.
+ * A receiver that has not connected yet is never replaced: the SDK keeps trying it by itself (after a camera restarted
+ * its NDI service it connected 44-52 s later, right after the source was announced again), and replacing it cannot
+ * make the source reachable sooner.
  */
 #define RECONNECT_FIRST_DELAY_NS 500000000ULL
 #define RECONNECT_RETRY_NS 1000000000ULL

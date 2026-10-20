@@ -60,9 +60,12 @@ Fast reconnect in `ndi_source_thread`:
 - When a source that already delivered video loses its NDI connection, the thread creates a new receiver after
   0.5 s. It does not wait for the SDK's ~16 s reconnect.
 - A refused attempt (connected, then closed by the sender) is retried after 1 s, after 60 s without video every 5 s.
-  An attempt that has not connected yet is never replaced: a receiver created by NDI name needs ~4 s to resolve the
-  name, and replacing it restarts the lookup (a 5-s replacement kept three cameras dark for minutes). The rule is
-  `should_reconnect` in `ndi-source-decision.h`, covered by `test-source-decision` (`-DENABLE_UNIT_TESTS=ON`).
+  An attempt that has not connected yet is never replaced; the SDK keeps trying it. The rule is `should_reconnect` in
+  `ndi-source-decision.h`, covered by `test-source-decision` (`-DENABLE_UNIT_TESTS=ON`).
+- `recv_desc` holds its own copies of the source and receiver names. `ndi_source_update` frees and re-duplicates
+  `s->config` strings on every settings update (e.g. when the Web Control URL arrives ~5 s after connecting), and a
+  fast reconnect creates receivers from `recv_desc` long after the last reset. Pointing into `s->config` gave reconnect
+  receivers a dangling name; in long runs they never connected (2026-10-20).
 - `NDIlib_recv_destroy` blocks ~15 s on a sender-closed session, so the old receiver is destroyed on its own thread
   (`retire_ndi_receiver`, at most 64 at a time). `obs_module_unload` joins them before `ndiLib->destroy()`.
 - Motivation and measurements (PTZOptics Move SE closes its NDI sessions on a fixed schedule):
