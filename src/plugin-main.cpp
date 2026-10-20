@@ -23,7 +23,6 @@
 #include "forms/update.h"
 #include "main-output.h"
 #include "preview-output.h"
-#include "ndi-finder.h"
 
 #include <QAction>
 #include <QDir>
@@ -460,7 +459,6 @@ bool obs_module_load(void)
 
 				// All seems compatible, proceed to register plugin features.
 				register_plugin_features();
-				NDIFinder::startUrlCache();
 			}
 		}
 	}
@@ -538,7 +536,6 @@ void obs_module_unload(void)
 	updateCheckStop();
 
 	if (ndiLib) {
-		NDIFinder::stopUrlCache();
 		// Fast-reconnect receivers still being destroyed on their own threads (up to ~15 s) must finish first.
 		ndi_source_join_retired_receivers();
 		ndiLib->destroy();

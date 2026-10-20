@@ -595,15 +595,10 @@ void *ndi_source_thread(void *data)
 
 	// Fast reconnect after the sender closed the session (see should_reconnect): time of the last video frame on
 	// this source, start of the current reconnect attempt, whether that attempt's receiver got connected.
-	// Reconnect receivers address the source by its remembered URL (NDIFinder::lookupUrl), so that they do not depend
-	// on NDI discovery in this process; a receiver that stays unconnected for 60 s is followed by one that switches
-	// between URL and name only.
 	uint64_t last_video_ns = 0;
 	uint64_t reconnect_attempt_ns = 0;
 	bool reconnect_attempt_connected = false;
 	int reconnect_attempts = 0;
-	bool reconnect_use_url = true;
-	std::string reconnect_url;
 
 	// Creates ndi_receiver (and ndi_frame_sync if enabled) from recv_desc; the previous ones must be gone.
 	auto create_ndi_receiver = [&]() -> bool {
@@ -707,7 +702,6 @@ void *ndi_source_thread(void *data)
 			reconnect_attempt_ns = 0;
 			reconnect_attempt_connected = false;
 			reconnect_attempts = 0;
-			reconnect_use_url = true;
 		}
 		last_video_ns = now_ns;
 	};
@@ -738,8 +732,6 @@ void *ndi_source_thread(void *data)
 			// Update recv_desc.source_to_connect_to.p_ndi_name
 			//
 			recv_desc.source_to_connect_to.p_ndi_name = s->config.ndi_source_name;
-			// A settings reset connects by name, like the first connect; only fast reconnects use the URL.
-			recv_desc.source_to_connect_to.p_url_address = nullptr;
 			obs_log(LOG_DEBUG,
 				"'%s' ndi_source_thread: reset_ndi_receiver; Setting recv_desc.source_to_connect_to.p_ndi_name='%s'",
 				obs_source_name, //
@@ -808,7 +800,6 @@ void *ndi_source_thread(void *data)
 			reconnect_attempt_ns = 0;
 			reconnect_attempt_connected = false;
 			reconnect_attempts = 0;
-			reconnect_use_url = true;
 		}
 		//
 		// reset_ndi_receiver: END
@@ -834,21 +825,12 @@ void *ndi_source_thread(void *data)
 			    retire_ndi_receiver(ndi_receiver, ndi_frame_sync, obs_source_name)) {
 				ndi_receiver = nullptr;
 				ndi_frame_sync = nullptr;
-				if (reconnect_attempt_ns != 0 && !reconnect_attempt_connected)
-					reconnect_use_url = !reconnect_use_url;
-				reconnect_url =
-					reconnect_use_url
-						? NDIFinder::lookupUrl(recv_desc.source_to_connect_to.p_ndi_name)
-						: std::string();
-				recv_desc.source_to_connect_to.p_url_address =
-					reconnect_url.empty() ? nullptr : reconnect_url.c_str();
 				reconnect_attempts++;
 				reconnect_attempt_ns = now_ns;
 				reconnect_attempt_connected = false;
 				obs_log(LOG_INFO,
-					"'%s' NDI connection lost: reconnect attempt %d at +%.3fs after the last video frame (%s)",
-					obs_source_name, reconnect_attempts, (double)(now_ns - last_video_ns) / 1e9,
-					reconnect_url.empty() ? "by name" : "by URL");
+					"'%s' NDI connection lost: reconnect attempt %d at +%.3fs after the last video frame",
+					obs_source_name, reconnect_attempts, (double)(now_ns - last_video_ns) / 1e9);
 				if (!create_ndi_receiver())
 					break;
 				if (config->TallyPreviewEnabled || config->TallyProgramEnabled)

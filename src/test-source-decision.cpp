@@ -86,12 +86,11 @@ int main()
 	assert(should_reconnect(a1 + 999 * ms, t0, a1, true) == false);
 	assert(should_reconnect(a1 + 1 * s, t0, a1, true) == true);
 
-	// Attempt not connected yet: kept for 60 s (the SDK connects it once the source resolves), then replaced so the
-	// next receiver can switch between remembered URL and NDI name (2026-10-20: in-process discovery went deaf).
+	// Attempt not connected yet (NDI name still resolving): never replaced, the SDK connects it when resolved.
+	// Replacing it every 5 s restarted the ~4-s name lookup and kept three cameras dark for minutes (2026-10-20).
 	assert(should_reconnect(a1 + 1 * s, t0, a1, false) == false);
 	assert(should_reconnect(a1 + 5 * s, t0, a1, false) == false);
-	assert(should_reconnect(a1 + 59999 * ms, t0, a1, false) == false);
-	assert(should_reconnect(a1 + 60 * s, t0, a1, false) == true);
+	assert(should_reconnect(a1 + 600 * s, t0, a1, false) == false);
 
 	// After 60 s without video a refused attempt waits 5 s
 	const uint64_t late = t0 + 60 * s;
