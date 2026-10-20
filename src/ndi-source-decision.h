@@ -69,13 +69,16 @@ static inline bool keep_thread_alive(int behavior, bool active, bool showing, si
  *
  * Called only while the receiver has no connection. last_video_ns is 0 until the source delivered video (the SDK
  * handles the initial connect), attempt_ns is 0 until the first attempt after the loss. attempt_connected tells
- * whether the current attempt's receiver was connected at some point: a refused session is retried after 1 s, a
- * receiver still resolving the source name or a source that is gone after 5 s. After 60 s without video every
- * attempt waits 5 s.
+ * whether the current attempt's receiver was connected at some point.
+ *
+ * A refused session (connected, then closed by the camera) is retried after 1 s, after 60 s without video every 5 s.
+ * A receiver that has not connected yet is never replaced: a receiver created by NDI name needs ~4 s or more to
+ * resolve the name after the camera closed the session, and the SDK connects it as soon as it resolves. Replacing it
+ * every few seconds restarts that lookup; on 2026-10-20 a 5-s replacement kept three cameras dark for minutes.
  */
 #define RECONNECT_FIRST_DELAY_NS 500000000ULL
 #define RECONNECT_RETRY_NS 1000000000ULL
-#define RECONNECT_PENDING_NS 5000000000ULL
+#define RECONNECT_SLOW_RETRY_NS 5000000000ULL
 #define RECONNECT_SLOW_AFTER_NS 60000000000ULL
 
 static inline bool should_reconnect(uint64_t now_ns, uint64_t last_video_ns, uint64_t attempt_ns,
@@ -85,11 +88,10 @@ static inline bool should_reconnect(uint64_t now_ns, uint64_t last_video_ns, uin
 		return false;
 	if (attempt_ns == 0)
 		return now_ns - last_video_ns >= RECONNECT_FIRST_DELAY_NS;
-	if (now_ns < attempt_ns)
+	if (!attempt_connected || now_ns < attempt_ns)
 		return false;
-	uint64_t wait_ns = attempt_connected ? RECONNECT_RETRY_NS : RECONNECT_PENDING_NS;
-	if (now_ns - last_video_ns >= RECONNECT_SLOW_AFTER_NS)
-		wait_ns = RECONNECT_PENDING_NS;
+	const uint64_t wait_ns = now_ns - last_video_ns >= RECONNECT_SLOW_AFTER_NS ? RECONNECT_SLOW_RETRY_NS
+										   : RECONNECT_RETRY_NS;
 	return now_ns - attempt_ns >= wait_ns;
 }
 

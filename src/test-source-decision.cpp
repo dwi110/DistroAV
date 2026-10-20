@@ -86,15 +86,21 @@ int main()
 	assert(should_reconnect(a1 + 999 * ms, t0, a1, true) == false);
 	assert(should_reconnect(a1 + 1 * s, t0, a1, true) == true);
 
-	// Attempt never connected (name lookup or source gone): retry after 5 s, not every second
+	// Attempt not connected yet (NDI name still resolving): never replaced, the SDK connects it when resolved.
+	// Replacing it every 5 s restarted the ~4-s name lookup and kept three cameras dark for minutes (2026-10-20).
 	assert(should_reconnect(a1 + 1 * s, t0, a1, false) == false);
-	assert(should_reconnect(a1 + 4999 * ms, t0, a1, false) == false);
-	assert(should_reconnect(a1 + 5 * s, t0, a1, false) == true);
+	assert(should_reconnect(a1 + 5 * s, t0, a1, false) == false);
+	assert(should_reconnect(a1 + 600 * s, t0, a1, false) == false);
 
-	// After 60 s without video every attempt waits 5 s, refused or not
+	// After 60 s without video a refused attempt waits 5 s
 	const uint64_t late = t0 + 60 * s;
 	assert(should_reconnect(late + 1 * s, t0, late, true) == false);
+	assert(should_reconnect(late + 4999 * ms, t0, late, true) == false);
 	assert(should_reconnect(late + 5 * s, t0, late, true) == true);
+	// ... and the switch happens at exactly 60 s since the last frame
+	const uint64_t a2 = t0 + 58 * s;
+	assert(should_reconnect(t0 + 59 * s, t0, a2, true) == true);
+	assert(should_reconnect(t0 + 60 * s, t0, a2, true) == false);
 
 	// Clock values before the reference points never trigger (no unsigned wrap)
 	assert(should_reconnect(t0 - 1, t0, 0, false) == false);
