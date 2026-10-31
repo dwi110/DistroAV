@@ -117,6 +117,9 @@ for exactly which files/callbacks this applies to.
 - Editing files under `src/`, `data/locale/` (translation strings), `docs/`.
 - Building locally (`cmake --build build_x64 --preset windows-ci-x64`).
 - Reading anything in `.deps/`, `build_x64/`, `release/` for reference (all gitignored, regenerated, never hand-edit).
+- Creating commits and normal pushes to the private `dwi110/DistroAV` fork for
+  user-requested work is authorized, including future tasks (user decision
+  2026-10-31). Preserve unrelated changes; never force-push or commit secrets.
 
 **Ask first:**
 - Changing `CMakeLists.txt`, `CMakePresets.json`, `buildspec.json`, or anything
@@ -130,9 +133,6 @@ for exactly which files/callbacks this applies to.
 **Never touch:**
 - [`lib/ndi/`](lib/ndi) — vendored third-party NDI SDK headers under their own license.
 - `.deps/`, `build_x64/`, `build_macos/`, `build_x86_64/`, `release*/` — generated, gitignored.
-- Creating or making git commits (`git commit`) or pushing — agents must leave
-  all committing to the user, regardless of how the change was made or how
-  confident the change is.
 
 ## Known gaps
 
