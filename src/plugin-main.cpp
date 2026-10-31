@@ -384,10 +384,20 @@ bool obs_module_load(void)
 	// The plugin will be severely limited in functionality if the NDI library is not installed.
 	// TO DO TBC Load library from a custom path defined by the user in the plugin settings.
 
-	// This will force fail the lib load (for automated testing).
-	ndiLib = Config::CheckNdiLibForceFail ? nullptr : load_ndilib();
+	// Apply the requested receive transport policy (process-local NDI_CONFIG_DIR) BEFORE the NDI
+	// runtime is loaded/initialized. If a non-`auto` policy cannot be applied, do not load NDI at all
+	// rather than silently running a different transport.
+	QString transport_error;
+	auto transport_ready = Config::ConfigureReceiveTransport(transport_error);
 
-	if (!ndiLib) {
+	// This will force fail the lib load (for automated testing).
+	ndiLib = (!transport_ready || Config::CheckNdiLibForceFail) ? nullptr : load_ndilib();
+
+	if (!transport_ready) {
+		auto message = "Error-431: " + QTStr("NDIPlugin.TransportError.Message") + "<br><br>" +
+			       transport_error.toHtmlEscaped();
+		showCriticalMessageBoxDelayed(Str("NDIPlugin.TransportError.Title"), message);
+	} else if (!ndiLib) {
 		auto title = Str("NDIPlugin.LibError.Title");
 		auto message = "Error-401: " + QTStr("NDIPlugin.LibError.Message") + "<br>";
 

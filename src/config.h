@@ -42,6 +42,7 @@
  * AutoCheckForUpdates=true
  * MainOutputGroups=
  * PreviewOutputGroups=
+ * ReceiveTransport=auto
  * ```
  */
 class Config {
@@ -89,6 +90,27 @@ public:
 	QString PreviewOutputGroups;
 	bool TallyProgramEnabled;
 	bool TallyPreviewEnabled;
+	/**
+	 * Requested NDI receiver transport policy (persisted as `ReceiveTransport`):
+	 * `auto` (default, inherited NDI config untouched), `rudp`, `udp`, `tcp`, `force_tcp`.
+	 * This is the requested policy, not an observed transport. Changes need an OBS restart.
+	 */
+	QString ReceiveTransport;
+
+	static bool IsValidReceiveTransport(const QString &policy);
+	/**
+	 * Policy that was in effect when the NDI runtime was loaded this session
+	 * (empty until ConfigureReceiveTransport ran), and the startup failure, if any.
+	 */
+	static QString StartupReceiveTransport;
+	static QString StartupReceiveTransportError;
+	/**
+	 * Startup only, strictly before the NDI runtime is loaded/initialized: for non-`auto`
+	 * policies writes a DistroAV-owned ndi-config.v1.json (inherited effective config + receive
+	 * transport overrides) and points this process' NDI_CONFIG_DIR at it.
+	 * Returns false (with `error`) if the policy cannot be applied; the caller must not load NDI then.
+	 */
+	static bool ConfigureReceiveTransport(QString &error);
 
 	QString GetInstallGUID();
 	bool AutoCheckForUpdates();

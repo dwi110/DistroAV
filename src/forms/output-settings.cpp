@@ -39,6 +39,18 @@ OutputSettings::OutputSettings(QWidget *parent) : QDialog(parent), ui(new Ui::Ou
 
 	connect(ui->buttonBox, SIGNAL(accepted()), this, SLOT(onFormAccepted()));
 
+	// Receive transport policy (requested policy; applied at next OBS start, before the NDI runtime loads)
+	ui->receiveTransportComboBox->addItem(QTStr("NDIPlugin.OutputSettings.ReceiveTransport.Auto"),
+					      QString("auto"));
+	ui->receiveTransportComboBox->addItem(QTStr("NDIPlugin.OutputSettings.ReceiveTransport.Rudp"),
+					      QString("rudp"));
+	ui->receiveTransportComboBox->addItem(QTStr("NDIPlugin.OutputSettings.ReceiveTransport.Udp"),
+					      QString("udp"));
+	ui->receiveTransportComboBox->addItem(QTStr("NDIPlugin.OutputSettings.ReceiveTransport.Tcp"),
+					      QString("tcp"));
+	ui->receiveTransportComboBox->addItem(QTStr("NDIPlugin.OutputSettings.ReceiveTransport.ForceTcp"),
+					      QString("force_tcp"));
+
 	// Listen for external config changes so the dialog can update while visible.
 	connect(ConfigNotifier::instance(), &ConfigNotifier::configChanged, this, &OutputSettings::onConfigChanged);
 
@@ -307,6 +319,8 @@ void OutputSettings::onFormAccepted()
 
 	config->AutoCheckForUpdates(ui->checkBoxAutoCheckForUpdates->isChecked());
 
+	config->ReceiveTransport = ui->receiveTransportComboBox->currentData().toString();
+
 	auto mainSupported = ui->mainOutputGroupBox->isEnabled();
 
 	obs_log(LOG_INFO, "Main output supported='%d'", mainSupported);
@@ -341,6 +355,14 @@ void OutputSettings::onFormAccepted()
 		}
 	} else {
 		preview_output_stop();
+	}
+
+	if (last_config.ReceiveTransport != config->ReceiveTransport) {
+		obs_log(LOG_INFO, "Receive transport policy saved as '%s' (requested policy); restart OBS to apply",
+			QT_TO_UTF8(config->ReceiveTransport));
+		if (config->ReceiveTransport != Config::StartupReceiveTransport)
+			QMessageBox::information(this, Str("NDIPlugin.OutputSettings.ReceiveTransport.RestartTitle"),
+						 QTStr("NDIPlugin.OutputSettings.ReceiveTransport.RestartMessage"));
 	}
 }
 
@@ -415,4 +437,28 @@ void OutputSettings::refreshUI()
 	ui->tallyPreviewCheckBox->setChecked(config->TallyPreviewEnabled);
 
 	ui->checkBoxAutoCheckForUpdates->setChecked(config->AutoCheckForUpdates());
+
+	auto transportIndex = ui->receiveTransportComboBox->findData(config->ReceiveTransport);
+	ui->receiveTransportComboBox->setCurrentIndex(transportIndex >= 0 ? transportIndex : 0);
+	if (!Config::StartupReceiveTransportError.isEmpty()) {
+		ui->receiveTransportStatus->setText(
+			QTStr("NDIPlugin.OutputSettings.ReceiveTransport.StartupFailed")
+				.arg(Config::StartupReceiveTransportError.toHtmlEscaped()));
+		ui->receiveTransportStatus->setStyleSheet("QWidget { color: #c62828; }");
+	} else {
+		auto activeIndex = ui->receiveTransportComboBox->findData(Config::StartupReceiveTransport);
+		auto activeText = activeIndex >= 0 ? ui->receiveTransportComboBox->itemText(activeIndex)
+						   : Config::StartupReceiveTransport;
+		auto savedText = ui->receiveTransportComboBox->currentText();
+		if (config->ReceiveTransport == Config::StartupReceiveTransport) {
+			ui->receiveTransportStatus->setText(
+				QTStr("NDIPlugin.OutputSettings.ReceiveTransport.StatusActive").arg(activeText));
+			ui->receiveTransportStatus->setStyleSheet(QString());
+		} else {
+			ui->receiveTransportStatus->setText(
+				QTStr("NDIPlugin.OutputSettings.ReceiveTransport.StatusPending")
+					.arg(savedText, activeText));
+			ui->receiveTransportStatus->setStyleSheet("QWidget { color: #b26a00; }");
+		}
+	}
 }

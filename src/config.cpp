@@ -20,8 +20,15 @@
 #include "plugin-main.h"
 
 #include <util/config-file.h>
+#include <obs-module.h>
 
 #include <QCoreApplication>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSaveFile>
 #include "config-notifier.h"
 
 #define SECTION_NAME "NDIPlugin"
@@ -36,6 +43,7 @@
 #define PARAM_TALLY_PROGRAM_ENABLED "TallyProgramEnabled"
 #define PARAM_TALLY_PREVIEW_ENABLED "TallyPreviewEnabled"
 #define PARAM_SKIP_UPDATE_VERSION "SkipUpdateVersion"
+#define PARAM_RECEIVE_TRANSPORT "ReceiveTransport"
 
 // App Settings
 #define PARAM_AUTO_CHECK_FOR_UPDATES "AutoCheckForUpdates"
@@ -53,6 +61,8 @@ bool Config::CheckObsForceFail = false;
 bool Config::CheckNdiLibBypass = false;
 bool Config::CheckObsBypass = false;
 int Config::DetectObsNdiForce = 0;
+QString Config::StartupReceiveTransport;
+QString Config::StartupReceiveTransportError;
 
 enum ObsConfigType { OBS_CONFIG_STRING, OBS_CONFIG_BOOL };
 
@@ -219,7 +229,8 @@ Config::Config()
 	  PreviewOutputName("OBS Preview"),
 	  PreviewOutputGroups(""),
 	  TallyProgramEnabled(true),
-	  TallyPreviewEnabled(true)
+	  TallyPreviewEnabled(true),
+	  ReceiveTransport("auto")
 {
 	ProcessCommandLine();
 	SetDefaultsToUserStore();
@@ -243,6 +254,8 @@ void Config::SetDefaultsToUserStore()
 
 		config_set_default_bool(obs_config, SECTION_NAME, PARAM_TALLY_PROGRAM_ENABLED, TallyProgramEnabled);
 		config_set_default_bool(obs_config, SECTION_NAME, PARAM_TALLY_PREVIEW_ENABLED, TallyPreviewEnabled);
+		config_set_default_string(obs_config, SECTION_NAME, PARAM_RECEIVE_TRANSPORT,
+					  QT_TO_UTF8(ReceiveTransport));
 	}
 }
 
@@ -284,6 +297,7 @@ void Config::Load()
 
 		TallyProgramEnabled = config_get_bool(obs_config, SECTION_NAME, PARAM_TALLY_PROGRAM_ENABLED);
 		TallyPreviewEnabled = config_get_bool(obs_config, SECTION_NAME, PARAM_TALLY_PREVIEW_ENABLED);
+		ReceiveTransport = config_get_string(obs_config, SECTION_NAME, PARAM_RECEIVE_TRANSPORT);
 	}
 }
 
@@ -302,6 +316,7 @@ void Config::Save()
 
 		config_set_bool(obs_config, SECTION_NAME, PARAM_TALLY_PROGRAM_ENABLED, TallyProgramEnabled);
 		config_set_bool(obs_config, SECTION_NAME, PARAM_TALLY_PREVIEW_ENABLED, TallyPreviewEnabled);
+		config_set_string(obs_config, SECTION_NAME, PARAM_RECEIVE_TRANSPORT, QT_TO_UTF8(ReceiveTransport));
 
 		config_save(obs_config);
 
@@ -420,4 +435,213 @@ void Config::Destroy()
 		delete _instance;
 		_instance = nullptr;
 	}
+}
+
+bool Config::IsValidReceiveTransport(const QString &policy)
+{
+	return policy == "auto" || policy == "rudp" || policy == "udp" || policy == "tcp" || policy == "force_tcp";
+}
+
+namespace {
+
+constexpr const char *NDI_CONFIG_FILE_NAME = "ndi-config.v1.json";
+constexpr const char *NDI_CONFIG_DIR_ENV = "NDI_CONFIG_DIR";
+constexpr const char *NDI_OWNED_CONFIG_DIR_NAME = "ndi-receive-transport";
+
+struct ReceiveTransportFlags {
+	bool rudp;
+	bool tcp;
+	bool unicast;
+	bool multicast;
+};
+
+// Flags are written to ndi.<proto>.recv.enable (standard NDI SDK configuration; no Advanced SDK needed).
+// rudp:      RUDP, SDK falls back to multi-TCP / base TCP
+// udp:       legacy unicast UDP+FEC, SDK falls back to base TCP
+// tcp:       multi-TCP, SDK falls back to legacy unicast UDP / base TCP
+// force_tcp: no UDP media permitted
+bool ReceiveTransportFlagsFor(const QString &policy, ReceiveTransportFlags &flags)
+{
+	if (policy == "rudp")
+		flags = {true, true, false, false};
+	else if (policy == "udp")
+		flags = {false, false, true, false};
+	else if (policy == "tcp")
+		flags = {false, true, true, false};
+	else if (policy == "force_tcp")
+		flags = {false, true, false, false};
+	else
+		return false;
+	return true;
+}
+
+QString NormalizedDir(const QString &dir)
+{
+	auto path = QDir::cleanPath(QFileInfo(dir).absoluteFilePath());
+#ifdef _WIN32
+	path = path.toLower();
+#endif
+	return path;
+}
+
+// Directory the NDI SDK reads when NDI_CONFIG_DIR is not set.
+// Windows: %ProgramData%\NDI ; Linux/macOS: $HOME/.ndi (NDI SDK "Platform Considerations").
+QString DefaultNdiConfigDir()
+{
+#ifdef _WIN32
+	auto program_data = qEnvironmentVariable("ProgramData");
+	if (program_data.isEmpty())
+		return QString();
+	return QDir(program_data).filePath("NDI");
+#else
+	return QDir(QDir::homePath()).filePath(".ndi");
+#endif
+}
+
+bool ReadBaselineConfig(const QString &dir, QJsonObject &root, QString &error)
+{
+	auto path = QDir(dir).filePath(NDI_CONFIG_FILE_NAME);
+	QFile file(path);
+	if (!file.exists()) {
+		// No file: the SDK uses its built-in defaults, so the baseline is empty.
+		root = QJsonObject();
+		return true;
+	}
+	if (!file.open(QIODevice::ReadOnly)) {
+		error = QString("cannot read baseline NDI configuration '%1': %2")
+				.arg(QDir::toNativeSeparators(path), file.errorString());
+		return false;
+	}
+	QJsonParseError parse_error;
+	auto document = QJsonDocument::fromJson(file.readAll(), &parse_error);
+	if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+		error = QString("baseline NDI configuration '%1' is not a valid JSON object (%2)")
+				.arg(QDir::toNativeSeparators(path), parse_error.errorString());
+		return false;
+	}
+	root = document.object();
+	return true;
+}
+
+// Sets ndi.<protocol>.recv.enable without touching any sibling key.
+bool SetReceiveEnable(QJsonObject &ndi, const char *protocol, bool enable, QString &error)
+{
+	QJsonObject protocol_object;
+	auto protocol_value = ndi.value(protocol);
+	if (!protocol_value.isUndefined()) {
+		if (!protocol_value.isObject()) {
+			error = QString("baseline NDI configuration has non-object 'ndi.%1'").arg(protocol);
+			return false;
+		}
+		protocol_object = protocol_value.toObject();
+	}
+	QJsonObject recv_object;
+	auto recv_value = protocol_object.value("recv");
+	if (!recv_value.isUndefined()) {
+		if (!recv_value.isObject()) {
+			error = QString("baseline NDI configuration has non-object 'ndi.%1.recv'").arg(protocol);
+			return false;
+		}
+		recv_object = recv_value.toObject();
+	}
+	recv_object["enable"] = enable;
+	protocol_object["recv"] = recv_object;
+	ndi[protocol] = protocol_object;
+	return true;
+}
+
+} // namespace
+
+bool Config::ConfigureReceiveTransport(QString &error)
+{
+	StartupReceiveTransportError.clear();
+	auto policy = Config::Current(false)->ReceiveTransport;
+
+	auto fail = [&](const QString &reason) {
+		error = QString("NDI receive transport '%1' could not be applied: %2").arg(policy, reason);
+		StartupReceiveTransport.clear();
+		StartupReceiveTransportError = error;
+		obs_log(LOG_ERROR, "ERR-431 - %s", QT_TO_UTF8(error));
+		return false;
+	};
+
+	if (!IsValidReceiveTransport(policy))
+		return fail("unknown policy value in configuration");
+
+	if (policy == "auto") {
+		// Leave the inherited/default NDI configuration (global file, launcher NDI_CONFIG_DIR, ...) untouched.
+		StartupReceiveTransport = policy;
+		obs_log(LOG_INFO, "config: NDI receive transport policy 'auto' (inherited NDI configuration unchanged)");
+		return true;
+	}
+
+	ReceiveTransportFlags flags;
+	if (!ReceiveTransportFlagsFor(policy, flags))
+		return fail("unknown policy value in configuration");
+
+	// Owned override directory (portable-aware OBS module config location).
+	auto owned_raw = obs_module_config_path(NDI_OWNED_CONFIG_DIR_NAME);
+	if (!owned_raw)
+		return fail("OBS module config directory is unavailable");
+	auto owned_dir = QDir::cleanPath(QFileInfo(QString::fromUtf8(owned_raw)).absoluteFilePath());
+	bfree(owned_raw);
+
+	// Baseline = effective configuration this process would use without our override.
+	// Never the owned directory itself, otherwise an earlier override would become the baseline.
+	auto inherited_dir = qEnvironmentVariable(NDI_CONFIG_DIR_ENV);
+	QString baseline_dir;
+	if (!inherited_dir.isEmpty()) {
+		baseline_dir = inherited_dir;
+	} else {
+		baseline_dir = DefaultNdiConfigDir();
+		if (baseline_dir.isEmpty())
+			return fail("default NDI configuration directory cannot be determined");
+	}
+	if (NormalizedDir(baseline_dir) == NormalizedDir(owned_dir))
+		return fail("NDI_CONFIG_DIR already points to the DistroAV override directory, "
+			    "so the original NDI configuration cannot be determined; restart OBS without it");
+
+	QJsonObject root;
+	QString read_error;
+	if (!ReadBaselineConfig(baseline_dir, root, read_error))
+		return fail(read_error);
+
+	QJsonObject ndi;
+	auto ndi_value = root.value("ndi");
+	if (!ndi_value.isUndefined()) {
+		if (!ndi_value.isObject())
+			return fail("baseline NDI configuration has non-object 'ndi'");
+		ndi = ndi_value.toObject();
+	}
+
+	QString set_error;
+	if (!SetReceiveEnable(ndi, "rudp", flags.rudp, set_error) ||
+	    !SetReceiveEnable(ndi, "tcp", flags.tcp, set_error) ||
+	    !SetReceiveEnable(ndi, "unicast", flags.unicast, set_error) ||
+	    !SetReceiveEnable(ndi, "multicast", flags.multicast, set_error))
+		return fail(set_error);
+	root["ndi"] = ndi;
+
+	if (!QDir().mkpath(owned_dir))
+		return fail(QString("cannot create '%1'").arg(QDir::toNativeSeparators(owned_dir)));
+
+	auto owned_file = QDir(owned_dir).filePath(NDI_CONFIG_FILE_NAME);
+	QSaveFile out(owned_file);
+	if (!out.open(QIODevice::WriteOnly))
+		return fail(QString("cannot write '%1': %2").arg(QDir::toNativeSeparators(owned_file), out.errorString()));
+	out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+	if (!out.commit())
+		return fail(QString("cannot write '%1': %2").arg(QDir::toNativeSeparators(owned_file), out.errorString()));
+
+	// Process-local only; must happen before the NDI runtime is loaded/initialized.
+	auto native_owned_dir = QDir::toNativeSeparators(owned_dir);
+	if (!qputenv(NDI_CONFIG_DIR_ENV, native_owned_dir.toUtf8()) ||
+	    qEnvironmentVariable(NDI_CONFIG_DIR_ENV) != native_owned_dir)
+		return fail("NDI_CONFIG_DIR could not be set for this process");
+
+	StartupReceiveTransport = policy;
+	obs_log(LOG_INFO,
+		"config: NDI receive transport policy '%s' applied via NDI_CONFIG_DIR='%s' (baseline '%s'); requested policy, not an observed transport",
+		QT_TO_UTF8(policy), QT_TO_UTF8(native_owned_dir), QT_TO_UTF8(QDir::toNativeSeparators(baseline_dir)));
+	return true;
 }

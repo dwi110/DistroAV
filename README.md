@@ -23,11 +23,15 @@
 
 Receive NDI video and audio in OBS
 
+**NDI receive transport:** *Tools → DistroAV NDI Settings → NDI receive transport* selects a policy for all NDI sources of this OBS instance: `Auto` (default; your existing NDI configuration is used unchanged), `RUDP`, `UDP`, `TCP` or `Force TCP` (no UDP media). It is the *requested* policy, saved as `ReceiveTransport` in the `[NDIPlugin]` section of OBS' user config, and applies only after an OBS restart; it does not show the transport a source actually negotiated. For non-`Auto` policies DistroAV writes its own `ndi-config.v1.json` (a copy of the effective NDI configuration plus the `ndi.{rudp,tcp,unicast,multicast}.recv.enable` flags) into the `ndi-receive-transport` folder of its OBS module config directory (`obs_module_config_path`, portable-aware) and sets `NDI_CONFIG_DIR` for the OBS process only, before the NDI runtime loads; the global NDI file and your environment are never modified. If that fails, NDI is not loaded and an error is shown. The per-source *Audio* checkbox is unchanged.
+
 <img width="400" alt="DistroAV-NDI-Source-Feature-Window" src="https://github.com/user-attachments/assets/fe8a3942-b4bf-42b5-84e6-e9971be95216" />
 
 ### NDI Output
 
 Transmit OBS video and audio to NDI
+
+The output-capability check does not allocate settings; merely opening the settings dialog or loading the module no longer leaves an `obs_data` reference at shutdown, including in an empty scene collection.
 
 <img width="400" alt="DistroAV-NDI-Output-Feature-Window" src="https://github.com/user-attachments/assets/4ee4dd5c-ff95-4b65-a32d-2064eaacc4c2" />
 

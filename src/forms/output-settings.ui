@@ -270,6 +270,43 @@
             </item>
 
             <item>
+                <widget class="QGroupBox" name="receiveTransportGroupBox">
+                    <property name="title">
+                        <string>NDIPlugin.OutputSettings.GroupBox.ReceiveTransport</string>
+                    </property>
+                    <layout class="QVBoxLayout" name="receiveTransportLayout">
+                        <item>
+                            <widget class="QComboBox" name="receiveTransportComboBox">
+                                <property name="toolTip">
+                                    <string>NDIPlugin.OutputSettings.ReceiveTransport.Tooltip</string>
+                                </property>
+                            </widget>
+                        </item>
+                        <item>
+                            <widget class="QLabel" name="receiveTransportNote">
+                                <property name="text">
+                                    <string>NDIPlugin.OutputSettings.ReceiveTransport.Note</string>
+                                </property>
+                                <property name="wordWrap">
+                                    <bool>true</bool>
+                                </property>
+                            </widget>
+                        </item>
+                        <item>
+                            <widget class="QLabel" name="receiveTransportStatus">
+                                <property name="text">
+                                    <string notr="true"></string>
+                                </property>
+                                <property name="wordWrap">
+                                    <bool>true</bool>
+                                </property>
+                            </widget>
+                        </item>
+                    </layout>
+                </widget>
+            </item>
+
+            <item>
                 <widget class="QLabel" name="labelRequirements">
                     <property name="text">
                         <string>NDIPlugin.OutputSettings.Requirements</string>
