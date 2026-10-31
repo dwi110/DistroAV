@@ -110,8 +110,7 @@ bool main_output_is_supported()
 	auto output_name = config->OutputName;
 	auto output_groups = config->OutputGroups;
 
-	obs_data_t *output_settings = obs_data_create();
-	auto output = obs_output_create("test_ndi_output", "Test NDI Output", output_settings, nullptr);
+	auto output = obs_output_create("test_ndi_output", "Test NDI Output", nullptr, nullptr);
 	bool is_supported = false;
 	context.last_error = QString("");
 
