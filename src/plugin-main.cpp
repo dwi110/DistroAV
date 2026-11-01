@@ -74,6 +74,11 @@ const NDIlib_v6 *load_ndilib();
 typedef const NDIlib_v6 *(*NDIlib_v6_load_)(void);
 QLibrary *loaded_lib = nullptr;
 
+QFunctionPointer resolve_ndi_symbol(const char *name)
+{
+	return loaded_lib ? loaded_lib->resolve(name) : nullptr;
+}
+
 OutputSettings *output_settings = nullptr;
 
 //

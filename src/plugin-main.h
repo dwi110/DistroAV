@@ -33,6 +33,9 @@
 
 extern const NDIlib_v6 *ndiLib;
 
+// Resolve optional SDK entry points from the same runtime as ndiLib.
+QFunctionPointer resolve_ndi_symbol(const char *name);
+
 /*
 The following accomplishes two goals:
 1. Enable the use of a local emulator at 127.0.0.1 for [non-production] testing Update

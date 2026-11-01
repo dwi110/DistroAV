@@ -25,6 +25,7 @@
 #include <util/threading.h>
 
 #include <QDesktopServices>
+#include <QCoreApplication>
 #include <QUrl>
 
 #include <atomic>
@@ -51,6 +52,11 @@
 #define PROP_PAN "ndi_pan"
 #define PROP_TILT "ndi_tilt"
 #define PROP_ZOOM "ndi_zoom"
+#define PROP_MONITOR "ndi_monitor"
+#define PROP_MONITOR_SERVER "ndi_monitor_server"
+#define PROP_MONITOR_VIDEO "ndi_monitor_video"
+#define PROP_MONITOR_AUDIO "ndi_monitor_audio"
+#define PROP_MONITOR_STATUS "ndi_monitor_status"
 
 #define PROP_BW_UNDEFINED -1
 #define PROP_BW_HIGHEST 0
@@ -101,7 +107,7 @@ typedef struct ptz_t {
 } ptz_t;
 
 typedef struct ndi_source_config_t {
-	bool reset_ndi_receiver = true;
+	std::atomic<bool> reset_ndi_receiver{true};
 	// Initialize value to true to ensure a receiver reset on OBS launch.
 
 	//
@@ -113,6 +119,8 @@ typedef struct ndi_source_config_t {
 	int latency;
 	bool framesync_enabled;
 	bool hw_accel_enabled;
+	bool monitor_enabled;
+	char *monitor_server;
 
 	//
 	// Changes that do NOT require the NDI receiver to be reset:
@@ -127,11 +135,21 @@ typedef struct ndi_source_config_t {
 	NDIlib_tally_t tally;
 } ndi_source_config_t;
 
+struct ndi_monitor_snapshot {
+	std::mutex mutex;
+	uint64_t revision = 0;
+	std::string status = "NDIPlugin.SourceProps.Monitor.Disabled";
+	std::string video;
+	std::string audio;
+	uint64_t video_ns = 0;
+	uint64_t audio_ns = 0;
+};
+
 typedef struct ndi_source_t {
 	obs_source_t *obs_source;
 	ndi_source_config_t config;
 
-	bool running;
+	std::atomic<bool> running{false};
 	pthread_t av_thread;
 	pthread_mutex_t lifecycle_mutex;
 
@@ -141,7 +159,271 @@ typedef struct ndi_source_t {
 	uint64_t last_frame_timestamp;
 
 	frame_tap_registry_t frame_taps;
+	ndi_monitor_snapshot *monitor;
 } ndi_source_t;
+
+static bool valid_monitor_server(const std::string &server)
+{
+	const std::string prefix = "127.0.0.1:";
+	if (server.compare(0, prefix.size(), prefix) != 0 || server.size() == prefix.size())
+		return false;
+	unsigned port = 0;
+	for (size_t i = prefix.size(); i < server.size(); ++i) {
+		if (server[i] < '0' || server[i] > '9')
+			return false;
+		port = port * 10 + unsigned(server[i] - '0');
+		if (port > 65535)
+			return false;
+	}
+	return port != 0;
+}
+
+// Owned exclusively by the capture thread. Never add an advertiser to an already
+// connecting receiver: NDI 6.3.2 can terminate the process on that path.
+class ndi_receiver_monitor {
+	ndi_source_t *source;
+	uint64_t revision = 0;
+	NDIlib_recv_instance_t receiver = nullptr;
+	NDIlib_recv_advertiser_instance_t advertiser = nullptr;
+	NDIlib_recv_listener_instance_t listener = nullptr;
+	std::string receiver_name_suffix;
+	std::string receiver_uuid;
+	std::string video;
+	std::string audio;
+	uint64_t last_poll_ns = 0;
+	uint64_t started_ns = 0;
+	uint64_t video_ns = 0;
+	uint64_t audio_ns = 0;
+	NDIlib_recv_performance_t previous_frames = {};
+	bool registered = false;
+	bool enabled = false;
+
+#define MONITOR_API(name) decltype(&NDIlib_##name) name = nullptr
+	MONITOR_API(recv_advertiser_create);
+	MONITOR_API(recv_advertiser_destroy);
+	MONITOR_API(recv_advertiser_add_receiver);
+	MONITOR_API(recv_advertiser_del_receiver);
+	MONITOR_API(recv_listener_create);
+	MONITOR_API(recv_listener_destroy);
+	MONITOR_API(recv_listener_is_connected);
+	MONITOR_API(recv_listener_get_receivers);
+	MONITOR_API(recv_listener_subscribe_events);
+	MONITOR_API(recv_listener_unsubscribe_events);
+	MONITOR_API(recv_listener_get_events);
+	MONITOR_API(recv_listener_free_events);
+#undef MONITOR_API
+
+	void publish(const char *status)
+	{
+		auto &snapshot = *source->monitor;
+		std::lock_guard<std::mutex> lock(snapshot.mutex);
+		if (snapshot.revision != revision)
+			return;
+		snapshot.status = status;
+		snapshot.video = video;
+		snapshot.audio = audio;
+		snapshot.video_ns = video_ns;
+		snapshot.audio_ns = audio_ns;
+	}
+
+	void forget_receiver()
+	{
+		if (listener && !receiver_uuid.empty())
+			recv_listener_unsubscribe_events(listener, receiver_uuid.c_str());
+		receiver_uuid.clear();
+		video.clear();
+		audio.clear();
+		if (listener) {
+			uint32_t count = 0;
+			const auto pending = recv_listener_get_events(listener, &count, 0);
+			if (pending)
+				recv_listener_free_events(listener, pending);
+		}
+	}
+
+public:
+	explicit ndi_receiver_monitor(ndi_source_t *s) : source(s) {}
+	~ndi_receiver_monitor() { stop(); }
+
+	void stop()
+	{
+		if (!enabled)
+			return;
+		forget_receiver();
+		if (listener)
+			recv_listener_destroy(listener);
+		listener = nullptr;
+		if (registered)
+			recv_advertiser_del_receiver(advertiser, receiver);
+		registered = false;
+		if (advertiser)
+			recv_advertiser_destroy(advertiser);
+		advertiser = nullptr;
+		receiver = nullptr;
+		video_ns = audio_ns = 0;
+		previous_frames = {};
+		publish("NDIPlugin.SourceProps.Monitor.Stopped");
+		enabled = false;
+	}
+
+	// Called before recv_create; reads only the monitoring configuration under its lock.
+	bool prepare(std::string &name, std::string &server)
+	{
+		stop();
+		{
+			std::lock_guard<std::mutex> lock(source->monitor->mutex);
+			enabled = source->config.monitor_enabled;
+			server = source->config.monitor_server ? source->config.monitor_server : "";
+			revision = source->monitor->revision;
+		}
+		if (!enabled)
+			return false;
+		if (!valid_monitor_server(server)) {
+			publish("NDIPlugin.SourceProps.Monitor.InvalidServer");
+			return false;
+		}
+#define RESOLVE_MONITOR(name) name = reinterpret_cast<decltype(name)>(resolve_ndi_symbol("NDIlib_" #name))
+		RESOLVE_MONITOR(recv_advertiser_create);
+		RESOLVE_MONITOR(recv_advertiser_destroy);
+		RESOLVE_MONITOR(recv_advertiser_add_receiver);
+		RESOLVE_MONITOR(recv_advertiser_del_receiver);
+		RESOLVE_MONITOR(recv_listener_create);
+		RESOLVE_MONITOR(recv_listener_destroy);
+		RESOLVE_MONITOR(recv_listener_is_connected);
+		RESOLVE_MONITOR(recv_listener_get_receivers);
+		RESOLVE_MONITOR(recv_listener_subscribe_events);
+		RESOLVE_MONITOR(recv_listener_unsubscribe_events);
+		RESOLVE_MONITOR(recv_listener_get_events);
+		RESOLVE_MONITOR(recv_listener_free_events);
+#undef RESOLVE_MONITOR
+		if (!ndiLib->recv_connect || !recv_advertiser_create || !recv_advertiser_destroy ||
+		    !recv_advertiser_add_receiver || !recv_advertiser_del_receiver || !recv_listener_create ||
+		    !recv_listener_destroy || !recv_listener_is_connected || !recv_listener_get_receivers ||
+		    !recv_listener_subscribe_events || !recv_listener_unsubscribe_events || !recv_listener_get_events ||
+		    !recv_listener_free_events) {
+			publish("NDIPlugin.SourceProps.Monitor.Unavailable");
+			return false;
+		}
+		static std::atomic<uint64_t> generation{0};
+		name += " [monitor " + std::to_string(QCoreApplication::applicationPid()) + "-" +
+			std::to_string(++generation) + "]";
+		receiver_name_suffix = " (" + name + ")";
+		last_poll_ns = 0;
+		started_ns = os_gettime_ns();
+		publish("NDIPlugin.SourceProps.Monitor.Waiting");
+		return true;
+	}
+
+	void attach(NDIlib_recv_instance_t instance, const std::string &server)
+	{
+		receiver = instance;
+		NDIlib_recv_advertiser_create_t ad_desc;
+		ad_desc.p_url_address = server.c_str();
+		advertiser = recv_advertiser_create(&ad_desc);
+		NDIlib_recv_listener_create_t listener_desc;
+		listener_desc.p_url_address = server.c_str();
+		listener = recv_listener_create(&listener_desc);
+		if (advertiser && listener)
+			registered = recv_advertiser_add_receiver(advertiser, receiver, false, true, nullptr);
+		if (!registered)
+			publish("NDIPlugin.SourceProps.Monitor.Unavailable");
+	}
+
+	bool is_enabled() const { return enabled; }
+
+	void poll(bool connected)
+	{
+		if (!enabled)
+			return;
+		const uint64_t now = os_gettime_ns();
+		if (last_poll_ns && now - last_poll_ns < 1000000000ULL)
+			return;
+		last_poll_ns = now;
+		if (!listener || !registered)
+			return;
+		if (!recv_listener_is_connected(listener)) {
+			forget_receiver();
+			publish("NDIPlugin.SourceProps.Monitor.Disconnected");
+			return;
+		}
+		if (!connected) {
+			forget_receiver();
+			video_ns = audio_ns = 0;
+			publish("NDIPlugin.SourceProps.Monitor.NoSource");
+			return;
+		}
+		// Receiver counters track real incoming frames, unlike frame-sync output,
+		// which can repeat video and synthesize silence after media stops.
+		NDIlib_recv_performance_t frames;
+		ndiLib->recv_get_performance(receiver, &frames, nullptr);
+		if (frames.video_frames > previous_frames.video_frames)
+			video_ns = now;
+		if (frames.audio_frames > previous_frames.audio_frames)
+			audio_ns = now;
+		previous_frames = frames;
+		uint32_t count = 0;
+		const auto receivers = recv_listener_get_receivers(listener, &count);
+		std::string uuid;
+		for (uint32_t i = 0; receivers && i < count; ++i) {
+			if (!receivers[i].p_name || !receivers[i].p_uuid)
+				continue;
+			const char *name = receivers[i].p_name;
+			const size_t length = strlen(name);
+			const size_t suffix_length = receiver_name_suffix.size();
+			if (length > suffix_length &&
+			    strcmp(name + length - suffix_length, receiver_name_suffix.c_str()) == 0) {
+				uuid = receivers[i].p_uuid; // SDK memory expires at the next listener call.
+				break;
+			}
+		}
+		if (uuid != receiver_uuid) {
+			forget_receiver();
+			receiver_uuid = uuid;
+			if (!uuid.empty())
+				recv_listener_subscribe_events(listener, receiver_uuid.c_str());
+		}
+		uint32_t num_events = 0;
+		const auto events = recv_listener_get_events(listener, &num_events, 0);
+		for (uint32_t i = 0; events && i < num_events; ++i) {
+			const auto &event = events[i];
+			if (receiver_uuid.empty() || !event.p_uuid || receiver_uuid != event.p_uuid ||
+			    !event.p_name || !event.p_value)
+				continue;
+			if (strcmp(event.p_name, "video-receive-mode") == 0)
+				video = event.p_value;
+			else if (strcmp(event.p_name, "audio-receive-mode") == 0)
+				audio = event.p_value;
+		}
+		if (events)
+			recv_listener_free_events(listener, events);
+		if (video.empty() && audio.empty())
+			publish(now - started_ns >= 10000000000ULL
+					? "NDIPlugin.SourceProps.Monitor.NoEvents"
+					: "NDIPlugin.SourceProps.Monitor.Waiting");
+		else
+			publish("NDIPlugin.SourceProps.Monitor.Active");
+	}
+};
+
+static void refresh_monitor_properties(ndi_source_t *s, obs_properties_t *props)
+{
+	auto &snapshot = *s->monitor;
+	std::lock_guard<std::mutex> lock(snapshot.mutex);
+	const uint64_t now = os_gettime_ns();
+	auto value = [now](const std::string &mode, uint64_t last_frame) {
+		return !mode.empty() && last_frame && now - last_frame < 3000000000ULL
+			       ? mode.c_str()
+			       : obs_module_text("NDIPlugin.SourceProps.Monitor.Unknown");
+	};
+	const auto video = QString(obs_module_text("NDIPlugin.SourceProps.Monitor.Video"))
+				   .arg(value(snapshot.video, snapshot.video_ns));
+	const auto audio = QString(obs_module_text("NDIPlugin.SourceProps.Monitor.Audio"))
+				   .arg(value(snapshot.audio, snapshot.audio_ns));
+	obs_property_set_description(obs_properties_get(props, PROP_MONITOR_VIDEO), QT_TO_UTF8(video));
+	obs_property_set_description(obs_properties_get(props, PROP_MONITOR_AUDIO), QT_TO_UTF8(audio));
+	obs_property_set_description(obs_properties_get(props, PROP_MONITOR_STATUS),
+				     obs_module_text(snapshot.status.c_str()));
+}
 
 static obs_source_t *find_filter_by_id(obs_source_t *context, const char *id)
 {
@@ -329,6 +611,25 @@ obs_properties_t *ndi_source_getproperties(void *data)
 
 	obs_properties_add_bool(props, PROP_AUDIO, obs_module_text("NDIPlugin.SourceProps.Audio"));
 
+	obs_properties_add_bool(props, PROP_MONITOR, obs_module_text("NDIPlugin.SourceProps.Monitor"));
+	obs_properties_add_text(props, PROP_MONITOR_SERVER,
+				obs_module_text("NDIPlugin.SourceProps.Monitor.Server"), OBS_TEXT_DEFAULT);
+	obs_properties_add_text(props, PROP_MONITOR_STATUS, "", OBS_TEXT_INFO);
+	obs_properties_add_text(props, PROP_MONITOR_VIDEO, "", OBS_TEXT_INFO);
+	obs_properties_add_text(props, PROP_MONITOR_AUDIO, "", OBS_TEXT_INFO);
+	obs_properties_add_button2(
+		props, "ndi_monitor_refresh", obs_module_text("NDIPlugin.SourceProps.Monitor.Refresh"),
+		[](obs_properties_t *properties, obs_property_t *, void *context) {
+			refresh_monitor_properties(static_cast<ndi_source_t *>(context), properties);
+			return true;
+		},
+		s);
+	obs_properties_add_text(
+		props, "ndi_monitor_requested",
+		QT_TO_UTF8(QString(obs_module_text("NDIPlugin.SourceProps.Monitor.Requested"))
+				   .arg(Config::StartupReceiveTransport)), OBS_TEXT_INFO);
+	refresh_monitor_properties(s, props);
+
 	obs_properties_t *group_ptz = obs_properties_create();
 	obs_properties_add_float_slider(group_ptz, PROP_PAN, obs_module_text("NDIPlugin.SourceProps.Pan"), -1.0, 1.0,
 					0.001);
@@ -355,6 +656,8 @@ void ndi_source_getdefaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, PROP_YUV_COLORSPACE, PROP_YUV_SPACE_BT709);
 	obs_data_set_default_int(settings, PROP_LATENCY, PROP_LATENCY_NORMAL);
 	obs_data_set_default_bool(settings, PROP_AUDIO, true);
+	obs_data_set_default_bool(settings, PROP_MONITOR, false);
+	obs_data_set_default_string(settings, PROP_MONITOR_SERVER, "127.0.0.1:15959");
 	obs_data_set_default_string(settings, "web_control_url", "");
 	obs_log(LOG_DEBUG, "-ndi_source_getdefaults(…)");
 }
@@ -571,6 +874,10 @@ void *ndi_source_thread(void *data)
 	// long after the last reset. A dangling source name made reconnect receivers never connect (2026-10-20).
 	std::string recv_receiver_name;
 	std::string recv_source_name;
+	std::string monitored_receiver_name;
+	std::string monitor_server;
+	ndi_receiver_monitor monitor(s);
+	bool monitor_enabled = false;
 
 	NDIlib_recv_instance_t ndi_receiver = nullptr;
 	NDIlib_video_frame_v2_t video_frame;
@@ -615,7 +922,18 @@ void *ndi_source_thread(void *data)
 			"'%s' ndi_source_thread: reset_ndi_receiver: +ndi_receiver = ndiLib->recv_create_v3(&recv_desc)",
 			obs_source_name);
 
-		ndi_receiver = ndiLib->recv_create_v3(&recv_desc);
+		monitored_receiver_name = recv_receiver_name;
+		const bool attach_monitor = monitor.prepare(monitored_receiver_name, monitor_server);
+		monitor_enabled = monitor.is_enabled();
+		recv_desc.p_ndi_recv_name = attach_monitor ? monitored_receiver_name.c_str() : recv_receiver_name.c_str();
+		auto create_desc = recv_desc;
+		if (attach_monitor)
+			create_desc.source_to_connect_to = NDIlib_source_t();
+		ndi_receiver = ndiLib->recv_create_v3(&create_desc);
+		if (ndi_receiver && attach_monitor) {
+			monitor.attach(ndi_receiver, monitor_server);
+			ndiLib->recv_connect(ndi_receiver, &recv_desc.source_to_connect_to);
+		}
 		recv_stats = {};
 		recv_stats.window_start_ns = os_gettime_ns();
 		// Poll the new receiver's Web Control URL as soon as it connects
@@ -718,8 +1036,8 @@ void *ndi_source_thread(void *data)
 		//
 		// reset_ndi_receiver: BEGIN
 		//
-		if (s->config.reset_ndi_receiver) {
-			s->config.reset_ndi_receiver = false;
+		if (s->config.reset_ndi_receiver.load(std::memory_order_acquire) &&
+		    s->config.reset_ndi_receiver.exchange(false)) {
 
 			// If config.ndi_receiver_name changed, then so did obs_source_name
 			obs_source_name = obs_source_get_name(s->obs_source);
@@ -786,6 +1104,7 @@ void *ndi_source_thread(void *data)
 			obs_log(LOG_DEBUG, "'%s' ndi_source_thread: reset_ndi_receiver: Resetting NDI receiver…",
 				obs_source_name);
 
+			monitor.stop();
 			if (ndi_frame_sync) {
 				obs_log(LOG_DEBUG, "'%s' ndi_source_thread: ndiLib->framesync_destroy(ndi_frame_sync)",
 					obs_source_name);
@@ -818,6 +1137,8 @@ void *ndi_source_thread(void *data)
 		// If not then micro-pause and restart the loop.
 		//
 		const int connections = ndiLib->recv_get_no_connections(ndi_receiver);
+		if (monitor_enabled)
+			monitor.poll(connections > 0);
 		if (connections > 0 && reconnect_attempt_ns != 0)
 			reconnect_attempt_connected = true;
 		if (connections == 0) {
@@ -827,9 +1148,11 @@ void *ndi_source_thread(void *data)
 				obs_source_name);
 #endif
 			const uint64_t now_ns = os_gettime_ns();
-			if (should_reconnect(now_ns, last_video_ns, reconnect_attempt_ns,
-					     reconnect_attempt_connected) &&
-			    retire_ndi_receiver(ndi_receiver, ndi_frame_sync, obs_source_name)) {
+			const bool reconnect = should_reconnect(now_ns, last_video_ns, reconnect_attempt_ns,
+							       reconnect_attempt_connected);
+			if (reconnect)
+				monitor.stop();
+			if (reconnect && retire_ndi_receiver(ndi_receiver, ndi_frame_sync, obs_source_name)) {
 				ndi_receiver = nullptr;
 				ndi_frame_sync = nullptr;
 				reconnect_attempts++;
@@ -1045,6 +1368,7 @@ void *ndi_source_thread(void *data)
 	// Main NDI receiver loop: END
 	//
 
+	monitor.stop();
 	if (ndi_frame_sync) {
 		if (ndiLib) {
 			obs_log(LOG_DEBUG,
@@ -1261,6 +1585,30 @@ void ndi_source_update(void *data, obs_data_t *settings)
 	auto new_ndi_source_name = obs_data_get_string(settings, PROP_SOURCE);
 	bool ndi_source_name_changed = safe_strcmp(s->config.ndi_source_name, new_ndi_source_name) != 0;
 	reset_ndi_receiver |= ndi_source_name_changed;
+	{
+		auto &snapshot = *s->monitor;
+		std::lock_guard<std::mutex> lock(snapshot.mutex);
+		const bool enabled = obs_data_get_bool(settings, PROP_MONITOR);
+		const char *server = obs_data_get_string(settings, PROP_MONITOR_SERVER);
+		const bool changed = enabled != s->config.monitor_enabled ||
+				     safe_strcmp(s->config.monitor_server, server) != 0;
+		reset_ndi_receiver |= changed;
+		if (changed || ndi_source_name_changed) {
+			++snapshot.revision;
+			snapshot.video.clear();
+			snapshot.audio.clear();
+			snapshot.video_ns = snapshot.audio_ns = 0;
+			snapshot.status = !enabled ? "NDIPlugin.SourceProps.Monitor.Disabled"
+						 : !valid_monitor_server(server)
+							   ? "NDIPlugin.SourceProps.Monitor.InvalidServer"
+							   : "NDIPlugin.SourceProps.Monitor.Waiting";
+		}
+		s->config.monitor_enabled = enabled;
+		if (changed) {
+			bfree(s->config.monitor_server);
+			s->config.monitor_server = bstrdup(server);
+		}
+	}
 	obs_log(LOG_DEBUG,
 		"'%s' ndi_source_update: Check for 'NDI Source Name' changes: new_ndi_source_name='%s' vs config.ndi_source_name='%s'",
 		obs_source_name, new_ndi_source_name, s->config.ndi_source_name);
@@ -1452,7 +1800,8 @@ void ndi_source_update(void *data, obs_data_t *settings)
 				//
 				// Thread is running; notify it if it needs to reset the NDI receiver
 				//
-				s->config.reset_ndi_receiver = reset_ndi_receiver;
+				if (reset_ndi_receiver)
+					s->config.reset_ndi_receiver = true;
 			}
 		} else {
 			//
@@ -1572,8 +1921,9 @@ void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)
 	auto obs_source_name = obs_source_get_name(obs_source);
 	obs_log(LOG_DEBUG, "'%s' +ndi_source_create(…)", obs_source_name);
 
-	auto s = (ndi_source_t *)bzalloc(sizeof(ndi_source_t));
+	auto s = new ndi_source_t{};
 	s->obs_source = obs_source;
+	s->monitor = new ndi_monitor_snapshot;
 	pthread_mutex_init(&s->lifecycle_mutex, nullptr);
 	frame_tap_registry_init(&s->frame_taps);
 	proc_handler_t *ph = obs_source_get_proc_handler(s->obs_source);
@@ -1614,8 +1964,10 @@ void ndi_source_destroy(void *data)
 		bfree(s->config.ndi_source_name);
 		s->config.ndi_source_name = nullptr;
 	}
+	bfree(s->config.monitor_server);
+	delete s->monitor;
 
-	bfree(s);
+	delete s;
 
 	obs_log(LOG_DEBUG, "'%s' -ndi_source_destroy(…)", obs_source_name);
 }
