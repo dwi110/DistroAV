@@ -25,6 +25,18 @@ Receive NDI video and audio in OBS
 
 **NDI receive transport:** *Tools → DistroAV NDI Settings → NDI receive transport* selects a policy for all NDI sources of this OBS instance: `Auto` (default; your existing NDI configuration is used unchanged), `RUDP`, `UDP`, `TCP` or `Force TCP` (no UDP media). It is the *requested* policy, saved as `ReceiveTransport` in the `[NDIPlugin]` section of OBS' user config, and applies only after an OBS restart; it does not show the transport a source actually negotiated. For non-`Auto` policies DistroAV writes its own `ndi-config.v1.json` (a copy of the effective NDI configuration plus the `ndi.{rudp,tcp,unicast,multicast}.recv.enable` flags) into the `ndi-receive-transport` folder of its OBS module config directory (`obs_module_config_path`, portable-aware) and sets `NDI_CONFIG_DIR` for the OBS process only, before the NDI runtime loads; the global NDI file and your environment are never modified. If that fails, NDI is not loaded and an error is shown. The per-source *Audio* checkbox is unchanged.
 
+**Optional actual transport:** In each source's properties, enable `ndi_monitor` and set
+`ndi_monitor_server` (default `127.0.0.1:15959`, loopback only). Start a separate local
+NDI Discovery Server first, for example
+`"C:\Program Files\NDI\NDI 6 Tools\Discovery Service\NDI Discovery Service.exe" -bind 127.0.0.1 -port 15959`.
+No service is installed and no global discovery configuration changes. The native
+read-only video/audio modes are SDK reports, not inferences from the policy or socket
+counts. Open properties or press **Refresh transport status** to update the snapshot.
+Missing APIs/server, disconnection or stale media show unknown while reception continues.
+If the server was absent when observation was enabled, toggle observation off/on after
+starting it. Monitoring advertises only the existing receiver with control disabled;
+it does not open another media receiver. Standard NDI 6.3.2 was exercised on Windows.
+
 <img width="400" alt="DistroAV-NDI-Source-Feature-Window" src="https://github.com/user-attachments/assets/fe8a3942-b4bf-42b5-84e6-e9971be95216" />
 
 ### NDI Output
